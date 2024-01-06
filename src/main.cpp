@@ -70,9 +70,9 @@
 #define PRESSURE_SENSOR_INSTALLED 1
 #define PREFER_FAHRENHEIT 1  
 #define FLOW_SETTLE_SECS 10                          // wait for empty pipe to fill and settle - normally set to 35
-#define INACTIVITY_TIMEOUT_SECS 60                   // wait this long before sleeping after last watering zone - normally set to 60
+#define INACTIVITY_TIMEOUT_SECS 90                   // wait this long before sleeping after last watering zone - normally set to 90
 #define HEARTBEAT_SLEEP_SECS  3600                   // seconds of sleep between wellness check wakeups - normally set to 3600
-#define COMMS_EXCHANGE_SECS 120                      // wait this long for comms exchange before sleeping
+#define COMMS_EXCHANGE_SECS 180                      // wait this long for comms exchange before sleeping
 #define uS_TO_S_FACTOR 1000000ULL                    // Conversion factor for micro seconds to seconds
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error (timestmap) is published if error condition true
@@ -88,11 +88,12 @@
 #define IRRIG_WIFI_STRENGTH_TOPIC "irrig_leak/wifi_dbm"
 #define IRRIG_BATTERY_VOLTS_TOPIC "irrig_leak/battery_volts"
 #define IRRIG_BATTERY_PERCENT_TOPIC "irrig_leak/battery_percent"
-#define IRRIG_OTA_READY_TOPIC "irrig_leak/ota_ready"        // TRUE when ready for OTA and MQTT
+#define IRRIG_OTA_READY_TOPIC "irrig_leak/ota_mqtt_ready"        // "1" when ready for OTA and MQTT
 #define IRRIG_HEARTBEAT_TIME_STAMP_TOPIC "irrig_leak/idle/time_stamp"
 #define IRRIG_PRESSURE_TOPIC "irrig_leak/idle/water_pressure"
 #define IRRIG_WATER_TEMPERATURE_TOPIC "irrig_leak/idle/water_temperature"
 #define IRRIG_REPORT_TIME_STAMP_TOPIC "irrig_leak/report/time_stamp"
+#define IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC "irrig_leak/report/tot_gals_all_zones"
 #define IRRIG_VALVES_OFF_LEAK_TOPIC "irrig_leak/report/valve_leak"  // flow sensed when all valves are off & there should be none
 #define IRRIG_GPM_TOPIC_PREFIX "irrig_leak/report/avg_gpm_zone"  // valve/zone number is appended to the end to create the complete topic
 #define IRRIG_PSI_TOPIC_PREFIX "irrig_leak/report/avg_psi_zone"  // valve/zone number is appended to the end to create the complete topic
@@ -355,7 +356,7 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
 
   sprintf(mqttMsg, "%d", WiFi.RSSI());
   mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
-  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC , "TRUE");
+  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC , "true");
 
   switch (w_reason)
   {
@@ -367,20 +368,20 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
       // wait a bit for potential OTA & MQTT exchanges
       startTick = millis();
       DEBUG_PRINTF("\nWaiting %d seconds for any OTA & MQTT traffic...\n", COMMS_EXCHANGE_SECS);
-      mqttClient.publish(IRRIG_OTA_READY_TOPIC, "TRUE", true);     // show ota_ready as TRUE
-      DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_OTA_READY_TOPIC , "TRUE");
+      mqttClient.publish(IRRIG_OTA_READY_TOPIC, "1", true);     // show ota_mqtt_ready as "1"
+      DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_OTA_READY_TOPIC , "true");
       while ((millis() - startTick) < (COMMS_EXCHANGE_SECS * 1000))
       {
         ArduinoOTA.handle();
         mqttClient.loop();
         digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
         pauseTick = millis();
-        while( (millis() - pauseTick) < 100 );
+        while( (millis() - pauseTick) < 300 );
         digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
         pauseTick = millis();
-        while( (millis() - pauseTick) < 100 );
+        while( (millis() - pauseTick) < 300 );
       }
-      mqttClient.publish(IRRIG_OTA_READY_TOPIC, "FALSE", true);     // show ota_ready as FALSE
+      mqttClient.publish(IRRIG_OTA_READY_TOPIC, "0", true);     // show ota_mqtt_ready as "0"
       DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_OTA_READY_TOPIC , "FALSE");
       break;
     }
@@ -404,17 +405,29 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
  */
 void setup_wifi()
 {
+  u_int j;
+  unsigned long pauseTick;
+  
   // We start by connecting to a WiFi network
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
 
   DEBUG_PRINT(F("\nWaiting for WiFi "));
-  while (WiFi.waitForConnectResult() != WL_CONNECTED)
+  while (WiFi.waitForConnectResult() != WL_CONNECTED)   // connection happens in a different thread - just waiting for results here
   {
     DEBUG_PRINT(F("."));
-    delay(5000);
-    ESP.restart();
+    for(j=0; j<100; j++)     // blink LED rapidly for 20s while trying to connect
+    {
+      digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
+      pauseTick = millis();
+      while( (millis() - pauseTick) < 100 );
+      digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
+      pauseTick = millis();
+      while( (millis() - pauseTick) < 100 );
+    }
+    ESP.restart();   // restart effectively starts sleep mode (initial state) & all data is lost
   }
 
   //randomSeed(micros());
@@ -545,7 +558,7 @@ boolean reconnect()
 void sendTotalsReport()
 {
   int i;
-  unsigned int valveOffLeakGals = 0;
+  unsigned int valveOffLeakGals = 0, galsAllZones = 0;
 
   mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
   DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
@@ -578,17 +591,25 @@ void sendTotalsReport()
     mqttClient.publish(mqttTopic, mqttMsg, true);
     DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
+    galsAllZones = galsAllZones + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
+
     if (zoneData[i].valveNum == 0)   // valNum == 0 means no valves are ON, so any flow must be leak
       valveOffLeakGals = valveOffLeakGals + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;  // accumulate leak gals
   }
+
+  sprintf(mqttMsg, "%d", galsAllZones);
+  mqttClient.publish(IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC , mqttMsg, true);
+  DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg);
 
   if (valveOffLeakGals > 0)
   {
     sprintf(mqttMsg, "%d", valveOffLeakGals);
     mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg, true);
+    DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg);
   }
   else
     mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, "0", true);
+    DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, "0");
 }
 
 /*
