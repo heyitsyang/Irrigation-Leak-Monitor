@@ -1141,4 +1141,3 @@ build/esp-idf/xtensa/CMakeFiles/__idf_xtensa.dir/xtensa_intr.c.obj
 build/partition_table/partition-table.bin
 test/README
 include/credentials.h
-include/credentials.h.priv
