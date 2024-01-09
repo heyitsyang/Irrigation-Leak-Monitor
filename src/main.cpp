@@ -46,7 +46,7 @@
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 #define TIMEZONE_EEPROM_OFFSET 0                     // location-to-timezone info - saved in case eztime server is down
 
-#define VERSION "Ver 0.1 build 2024.01.1"
+#define VERSION "Ver 0.1 build 2024.01.2"
 
 // GPIO PIN DEFINITIONS
 #define BAT_ADC_PIN 12
@@ -88,7 +88,6 @@
 #define IRRIG_WIFI_STRENGTH_TOPIC "irrig_leak/wifi_dbm"
 #define IRRIG_BATTERY_VOLTS_TOPIC "irrig_leak/battery_volts"
 #define IRRIG_BATTERY_PERCENT_TOPIC "irrig_leak/battery_percent"
-#define IRRIG_OTA_READY_TOPIC "irrig_leak/ota_mqtt_ready"        // "1" when ready for OTA and MQTT
 #define IRRIG_HEARTBEAT_TIME_STAMP_TOPIC "irrig_leak/idle/time_stamp"
 #define IRRIG_PRESSURE_TOPIC "irrig_leak/idle/water_pressure"
 #define IRRIG_WATER_TEMPERATURE_TOPIC "irrig_leak/idle/water_temperature"
@@ -231,7 +230,7 @@ void setup()
 
           flowTickStart = millis();   // establish start time
 
-          digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
+          digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
           while(digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)      // wait for pulse to go low
           {
             flowTickNow = millis();
@@ -240,11 +239,11 @@ void setup()
               DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while active low FLOW_SENSOR_BLUE_PIN = LOW"));
               exchangeComms(wakeup_reason);
               GoToSleep();
-              break;             // break out of loop in case LEEP_INHIBIT_PIN is set
+              break;             // break out of loop in case SLEEP_INHIBIT_PIN is set
             }
             yield();
           }
-          digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
+          digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
 
           if((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))   // settling time reached
           {
@@ -368,21 +367,18 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
       // wait a bit for potential OTA & MQTT exchanges
       startTick = millis();
       DEBUG_PRINTF("\nWaiting %d seconds for any OTA & MQTT traffic...\n", COMMS_EXCHANGE_SECS);
-      mqttClient.publish(IRRIG_OTA_READY_TOPIC, "1", true);     // show ota_mqtt_ready as "1"
-      DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_OTA_READY_TOPIC , "true");
       while ((millis() - startTick) < (COMMS_EXCHANGE_SECS * 1000))
       {
-        ArduinoOTA.handle();
         mqttClient.loop();
         digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
         pauseTick = millis();
-        while( (millis() - pauseTick) < 300 );
+        while( (millis() - pauseTick) < 400 );
         digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
         pauseTick = millis();
-        while( (millis() - pauseTick) < 300 );
+        while( (millis() - pauseTick) < 200 );
+        ArduinoOTA.handle();                        // remember program never returns from OTA
       }
-      mqttClient.publish(IRRIG_OTA_READY_TOPIC, "0", true);     // show ota_mqtt_ready as "0"
-      DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_OTA_READY_TOPIC , "FALSE");
+      
       break;
     }
     case ESP_SLEEP_WAKEUP_TIMER:
@@ -407,25 +403,35 @@ void setup_wifi()
 {
   u_int j;
   unsigned long pauseTick;
+  // IPAddress staticIP(192,168,0,254), subnet(255, 255, 255, 0), gateway(192, 168, 0, 1) ,primaryDNS(10, 27, 0, 1);
   
   // We start by connecting to a WiFi network
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
+  // if(!WiFi.config(staticIP, gateway, subnet, primaryDNS)) 
+  // {
+  //   DEBUG_PRINTLN("Failed to configure Static IP");
+  // } 
+  // else 
+  // {
+  //   DEBUG_PRINT("Static IP Address: ");
+  //   DEBUG_PRINTLN(WiFi.localIP()); 
+  // }
 
   DEBUG_PRINT(F("\nWaiting for WiFi "));
   while (WiFi.waitForConnectResult() != WL_CONNECTED)   // connection happens in a different thread - just waiting for results here
   {
     DEBUG_PRINT(F("."));
-    for(j=0; j<100; j++)     // blink LED rapidly for 20s while trying to connect
+    for(j=0; j<60; j++)     // blink LED for 60s while trying to connect
     {
       digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
       pauseTick = millis();
-      while( (millis() - pauseTick) < 100 );
+      while( (millis() - pauseTick) < 500 );
       digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
       pauseTick = millis();
-      while( (millis() - pauseTick) < 100 );
+      while( (millis() - pauseTick) < 500 );
     }
     ESP.restart();   // restart effectively starts sleep mode (initial state) & all data is lost
   }
@@ -446,7 +452,7 @@ void setup_wifi()
 void setup_OTA()
 {
   // Port defaults to 8266
-  // ArduinoOTA.setPort(8266);
+  //  ArduinoOTA.setPort(8266);
 
   // Hostname defaults to esp8266-[ChipID]
   ArduinoOTA.setHostname(DEVICE_HOST_NAME);
