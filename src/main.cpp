@@ -88,9 +88,9 @@
 #define IRRIG_WIFI_STRENGTH_TOPIC "irrig_leak/wifi_dbm"
 #define IRRIG_BATTERY_VOLTS_TOPIC "irrig_leak/battery_volts"
 #define IRRIG_BATTERY_PERCENT_TOPIC "irrig_leak/battery_percent"
-#define IRRIG_HEARTBEAT_TIME_STAMP_TOPIC "irrig_leak/idle/time_stamp"
-#define IRRIG_PRESSURE_TOPIC "irrig_leak/idle/water_pressure"
-#define IRRIG_WATER_TEMPERATURE_TOPIC "irrig_leak/idle/water_temperature"
+#define IRRIG_IDLE_TIME_STAMP_TOPIC "irrig_leak/idle/time_stamp"
+#define IRRIG_IDLE_PRESSURE_TOPIC "irrig_leak/idle/water_pressure"
+#define IRRIG_IDLE_WATER_TEMPERATURE_TOPIC "irrig_leak/idle/water_temperature"
 #define IRRIG_REPORT_TIME_STAMP_TOPIC "irrig_leak/report/time_stamp"
 #define IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC "irrig_leak/report/tot_gals_all_zones"
 #define IRRIG_VALVES_OFF_LEAK_TOPIC "irrig_leak/report/valve_leak"  // flow sensed when all valves are off & there should be none
@@ -361,6 +361,9 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
   {
     case ESP_SLEEP_WAKEUP_EXT0:
     {
+      mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
+      DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+
       sendBatteryStatus();
       sendTotalsReport();
       
@@ -383,10 +386,12 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
     }
     case ESP_SLEEP_WAKEUP_TIMER:
     {
-      mqttClient.publish(IRRIG_HEARTBEAT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
-      DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_HEARTBEAT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+      mqttClient.publish(IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
+      DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+      
       sendBatteryStatus();
       sendPressureSensorStatus();
+      
       break;
     }
     default:
@@ -555,9 +560,6 @@ void sendTotalsReport()
   int i;
   unsigned int valveOffLeakGals = 0, galsAllZones = 0;
 
-  mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
-  DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
-
   for(i=0; i<(TOT_NUM_VALVES+1); i++)
   {
     // send GPM
@@ -619,11 +621,11 @@ void sendPressureSensorStatus()
     idleWaterPressure = readPressureSensor(READ_PRESSURE);
     idleWaterTemperature = readPressureSensor(READ_TEMPERATURE);
     sprintf(mqttMsg, "%.2f", idleWaterPressure);
-    mqttClient.publish(IRRIG_PRESSURE_TOPIC, mqttMsg, true);
-    DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_PRESSURE_TOPIC, mqttMsg);
+    mqttClient.publish(IRRIG_IDLE_PRESSURE_TOPIC, mqttMsg, true);
+    DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_PRESSURE_TOPIC, mqttMsg);
     sprintf(mqttMsg, "%.2f", idleWaterTemperature);
-    mqttClient.publish(IRRIG_WATER_TEMPERATURE_TOPIC, mqttMsg, true);
-    DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WATER_TEMPERATURE_TOPIC, mqttMsg);
+    mqttClient.publish(IRRIG_IDLE_WATER_TEMPERATURE_TOPIC, mqttMsg, true);
+    DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_WATER_TEMPERATURE_TOPIC, mqttMsg);
   }
 }
 
