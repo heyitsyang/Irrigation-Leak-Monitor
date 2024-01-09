@@ -403,22 +403,11 @@ void setup_wifi()
 {
   u_int j;
   unsigned long pauseTick;
-  // IPAddress staticIP(192,168,0,254), subnet(255, 255, 255, 0), gateway(192, 168, 0, 1) ,primaryDNS(10, 27, 0, 1);
   
-  // We start by connecting to a WiFi network
-
+  // Connect to a WiFi network
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
-  // if(!WiFi.config(staticIP, gateway, subnet, primaryDNS)) 
-  // {
-  //   DEBUG_PRINTLN("Failed to configure Static IP");
-  // } 
-  // else 
-  // {
-  //   DEBUG_PRINT("Static IP Address: ");
-  //   DEBUG_PRINTLN(WiFi.localIP()); 
-  // }
 
   DEBUG_PRINT(F("\nWaiting for WiFi "));
   while (WiFi.waitForConnectResult() != WL_CONNECTED)   // connection happens in a different thread - just waiting for results here
