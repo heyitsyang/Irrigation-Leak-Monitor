@@ -413,6 +413,7 @@ void setup_wifi()
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
+  DEBUG_PRINTLN(WiFi.macAddress());
 
   DEBUG_PRINT(F("\nWaiting for WiFi "));
   while (WiFi.waitForConnectResult() != WL_CONNECTED)   // connection happens in a different thread - just waiting for results here
@@ -635,13 +636,13 @@ void sendPressureSensorStatus()
 void sendBatteryStatus()
 {
   float voltage = 0.0;
-  uint8_t percentage = 100;
+  uint8_t percentage = 0;
 
   voltage = ((float)((readADC_Cal(analogRead(BAT_ADC_PIN))) * 2))/1000;
 
   percentage = 2836.9625 * pow(voltage, 4) - 43987.4889 * pow(voltage, 3) + 255233.8134 * pow(voltage, 2) - 656689.7123 * voltage + 632041.7303;
-  if (voltage >= 4.20) percentage = 100;
-  if (voltage <= 3.20) percentage = 0;  // orig 3.5
+  if (voltage >= 4.00) percentage = 100;
+  if (voltage <= 3.30) percentage = 0;  // orig 3.5
   
   sprintf(mqttMsg, "%.2f", voltage);
   mqttClient.publish(IRRIG_BATTERY_VOLTS_TOPIC, mqttMsg, true);  
