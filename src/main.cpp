@@ -46,7 +46,7 @@
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 #define TIMEZONE_EEPROM_OFFSET 0                     // location-to-timezone info - saved in case eztime server is down
 
-#define VERSION "Ver 0.1 build 2024.01.2"
+#define VERSION "Ver 0.2 build 2024.02.1"
 
 // GPIO PIN DEFINITIONS
 #define BAT_ADC_PIN 12
@@ -411,6 +411,7 @@ void setup_wifi()
   
   // Connect to a WiFi network
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname(DEVICE_HOST_NAME);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
   DEBUG_PRINTLN(WiFi.macAddress());
