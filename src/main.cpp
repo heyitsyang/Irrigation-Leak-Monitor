@@ -46,7 +46,7 @@
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 #define TIMEZONE_EEPROM_OFFSET 0                     // location-to-timezone info - saved in case eztime server is down
 
-#define VERSION "Ver 0.2 build 2024.02.1"
+#define VERSION "Ver 0.2 build 2025.02.0"
 
 // GPIO PIN DEFINITIONS
 #define BAT_ADC_PIN 12
@@ -317,7 +317,7 @@ void setup()
       print_wakeup_reason(wakeup_reason);
   }
 
-  DEBUG_PRINTLN(F("SHOULD NEVER REACH THIS"));
+  DEBUG_PRINTLN(F("SHOULD NEVER REACH THIS EXCEPT AT FIRST BOOT"));
   GoToSleep();
 }
 
@@ -355,7 +355,7 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
 
   sprintf(mqttMsg, "%d", WiFi.RSSI());
   mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
-  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC , "true");
+  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC , mqttMsg);
 
   switch (w_reason)
   {
@@ -420,7 +420,7 @@ void setup_wifi()
   while (WiFi.waitForConnectResult() != WL_CONNECTED)   // connection happens in a different thread - just waiting for results here
   {
     DEBUG_PRINT(F("."));
-    for(j=0; j<60; j++)     // blink LED for 60s while trying to connect
+    for(j=0; j<90; j++)     // blink LED for 90s while trying to connect
     {
       digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
       pauseTick = millis();
@@ -713,33 +713,33 @@ void print_wakeup_reason(esp_sleep_wakeup_cause_t w_reason)
   switch (w_reason) {
     case ESP_SLEEP_WAKEUP_EXT0 : 
     {
-      DEBUG_PRINTLN(F("\nWakeup caused by external signal using RTC_IO"));
+      DEBUG_PRINTLN(F("\nWAKEUP CAUSED BY EXTERNAL SIGNAL USING RTC_IO"));
       DEBUG_PRINTF("Awakened on I/O level = %d\n", wakeup_level);
       break;
     }
     case ESP_SLEEP_WAKEUP_EXT1 :
     {
-      DEBUG_PRINTLN(F("\nWakeup caused by external signal using RTC_CNTL"));
+      DEBUG_PRINTLN(F("\nWAKEUP CAUSED BY EXTERNAL SIGNAL USING RTC_CNTL"));
       break;
     }
     case ESP_SLEEP_WAKEUP_TIMER :
     {
-      DEBUG_PRINTLN(F("\nWakeup caused by timer"));
+      DEBUG_PRINTLN(F("\nWAKEUP CAUSED BY TIMER"));
       break;
     }
     case ESP_SLEEP_WAKEUP_TOUCHPAD :
     {
-      DEBUG_PRINTLN(F("\nWakeup caused by touchpad"));
+      DEBUG_PRINTLN(F("\nERROR - WAKEUP CAUSED BY TOUCHPAD - ERROR"));
       break;
     }
     case ESP_SLEEP_WAKEUP_ULP :
     {
-      DEBUG_PRINTLN(F("\nWakeup caused by ULP program"));
+      DEBUG_PRINTLN(F("\nERROR - WAKEUP CAUSED BY ULP PROGRAM - ERROR"));
       break;
     }
     default :
     {
-      DEBUG_PRINTF("\nWakeup was not caused by deep sleep: %d\n", w_reason);
+      DEBUG_PRINTF("\nWAKEUP CAUSED BY DEEP SLEEP: %d\n", w_reason);
       break;
     }
   }
