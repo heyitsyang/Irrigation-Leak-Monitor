@@ -46,7 +46,7 @@
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 #define TIMEZONE_EEPROM_OFFSET 0                     // location-to-timezone info - saved in case eztime server is down
 
-#define VERSION "Ver 0.2 build 2025.02.0"
+#define VERSION "Ver 0.2 build 2025.03.0"
 
 // GPIO PIN DEFINITIONS
 #define BAT_ADC_PIN 12
@@ -61,8 +61,8 @@
 #define FLOW_SENSOR_BLUE_PIN 9                       // Hunter HC100FLOW flow meter - ACTIVE LOW
 #define FLOW_SENSOR_RED_PIN 11                       // not used for wake since we can only use one ext0 source
 
-#define I2C_SCL_PIN 14    
-#define I2C_SDA_PIN 13
+#define I2C_SCL_PIN 13   
+#define I2C_SDA_PIN 14
 #define PRESSURE_SENSOR_I2C_ADDR 0x28                // TE M3200 pressure sensor
 
 // OPERATIONAL PARAMETERS & PREFERENCES
