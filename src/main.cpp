@@ -3,6 +3,11 @@
  * Irrigation Leak Detector *
  *                          *
  ****************************/
+
+/* To Do List
+   - add watering duration for each zone to report
+*/
+
 #include <Arduino.h>
 #ifdef ESP32
   #include <WiFi.h>
@@ -20,11 +25,11 @@
 #include <ezTime.h>
 
 // local definitions
-#include "esp_adc_cal.h"  // from LilyGo TZ example code
+#include "esp_adc_cal.h"     // from LilyGo TZ example code
 #include "prototypes.h"
 #include "credentials.h"     // <<<<<<<  COMMENT THIS LINE OUT & ENTER YOUR CREDENTIALS BELOW - this contains stuff for my WIFI network, not yours
 
-#define DEBUG 1     // comment line out to undefine - 0 is still defined
+#define DEBUG 1     // comment line out to undefine - setting to 0 is still considered defined
 #ifdef DEBUG
   #define DEBUG_BEGIN(...) Serial.begin(__VA_ARGS__)
   #define DEBUG_PRINT(...) Serial.print(__VA_ARGS__)
@@ -46,7 +51,7 @@
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 #define TIMEZONE_EEPROM_OFFSET 0                     // location-to-timezone info - saved in case eztime server is down
 
-#define VERSION "Ver 0.2 build 2025.03.0"
+#define VERSION "Ver 0.2 build 2025.04.0"
 
 // GPIO PIN DEFINITIONS
 #define BAT_ADC_PIN 12
@@ -66,13 +71,14 @@
 #define PRESSURE_SENSOR_I2C_ADDR 0x28                // TE M3200 pressure sensor
 
 // OPERATIONAL PARAMETERS & PREFERENCES
+#define FLOW_GALS_PER_PULSE  1
 #define TOT_NUM_VALVES 4
 #define PRESSURE_SENSOR_INSTALLED 1
 #define PREFER_FAHRENHEIT 1  
 #define FLOW_SETTLE_SECS 10                          // wait for empty pipe to fill and settle - normally set to 35
 #define INACTIVITY_TIMEOUT_SECS 90                   // wait this long before sleeping after last watering zone - normally set to 90
 #define HEARTBEAT_SLEEP_SECS  3600                   // seconds of sleep between wellness check wakeups - normally set to 3600
-#define COMMS_EXCHANGE_SECS 180                      // wait this long for comms exchange before sleeping
+#define COMMS_EXCHANGE_TIMEOUT_SECS 180              // wait this long for comms exchange before sleeping
 #define uS_TO_S_FACTOR 1000000ULL                    // Conversion factor for micro seconds to seconds
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error (timestmap) is published if error condition true
@@ -128,18 +134,18 @@ char mqttTopic[MQTT_MAX_TOPIC_SIZE];
 struct ZoneSummary zoneData[TOT_NUM_VALVES+1];           // array to keep flow data
 
 uint32_t blinkMillis = 0;
-int valveThisFlowTick = 0, valveLastFlowTick = -1;
+int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
 esp_sleep_wakeup_cause_t wakeup_reason;
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastPublish = 0, pressureLastRead = 0, lastValveSync = 0, lastPressErrReport = 0;
-unsigned long flowTickNow, flowTickStart, flowTickPrev = 0, startSettling, flowTickDuration;
+unsigned long millisNow, millisStart, millisPrev = 0, startSettling, millisElapsed;
 bool flowSettled = false;
 unsigned long tempNow, lastPublishNow, pressureReadNow, mqttNow, lastPressErrReportNow;
 byte sensorStatus;
 float psiTminus0 = 0, psiTminus1 = 0, psiTminus2 = 0;         // psiTminus0 is the current pressure, psiTminus1 is the previous, psiTminus2 is the one before
 float avgPressure, maxPressure, minPressure, currentPressure, temperature, runningTotPressure = 0; 
 float instantGPM = 0, runningTotGPM = 0, avgGPM, maxGPM; 
-unsigned int flowPulseCount = 0, flowPreMeasureCount = 0;;                             // one pulse = one gallon
+unsigned int flowPulseCount = 0, flowPreMeasurePulseCount = 0;;                             // one pulse = one gallon
 unsigned int pressureReadInterval;
 bool once;
 
@@ -180,8 +186,8 @@ void setup()
 
   digitalWrite(BUILT_IN_LED_PIN, HIGH);             // LED on
   flowPulseCount = 0;
-  flowTickDuration = 0;
-  flowTickPrev = 0;
+  millisElapsed = 0;
+  millisPrev = 0;
   avgPressure = 0;
   maxPressure = 0;
   minPressure = 0;
@@ -193,25 +199,27 @@ void setup()
 
   switch (wakeup_reason)
   {
-    case ESP_SLEEP_WAKEUP_EXT0:                                               // wait FLOW_SETTLE_TIME then count pulses until timeout
+    case ESP_SLEEP_WAKEUP_EXT0:                                              // external interrupt wakeup
     {
       print_wakeup_reason(wakeup_reason);
+
+      // LOOP UNTIL IRRIGATION IS DONE
       while (true)
       {
-        if (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)
+        if (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)                        // pulse is active when LOW
         {
-          currentPressure = readPressureSensor(READ_PRESSURE);
+          currentPressure = readPressureSensor(READ_PRESSURE);               // read pressure each loop & record min & max
           if (maxPressure < currentPressure)
             maxPressure = currentPressure;
           if (minPressure > currentPressure)
             minPressure = currentPressure;
-          valveThisFlowTick = getActiveValve();
-          if (valveThisFlowTick != valveLastFlowTick)                         // if zone has changed
+          valveThisFlowPulse = getActiveValve();
+          if (valveThisFlowPulse != valveLastFlowPulse)                      // if zone has changed
           {
             once = true;
             startSettling = millis();
             flowPulseCount = 1;
-            flowPreMeasureCount = 0;                                          // initialize varialbles
+            flowPreMeasurePulseCount = 0;                                    // initialize variables
             avgPressure = currentPressure;
             maxPressure = currentPressure;
             minPressure = currentPressure;
@@ -228,13 +236,13 @@ void setup()
             avgPressure = runningTotPressure/flowPulseCount;
           }
 
-          flowTickStart = millis();   // establish start time
+          millisStart = millis();                              // establish start time
 
-          digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
+          digitalWrite(BUILT_IN_LED_PIN, HIGH);                // LED on
           while(digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)      // wait for pulse to go low
           {
-            flowTickNow = millis();
-            if ((flowTickNow - flowTickStart) > (INACTIVITY_TIMEOUT_SECS * 1000))   // in case magnet stops on LOW
+            millisNow = millis();
+            if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))   // in case magnet stops on LOW
             { 
               DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while active low FLOW_SENSOR_BLUE_PIN = LOW"));
               exchangeComms(wakeup_reason);
@@ -245,49 +253,50 @@ void setup()
           }
           digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
 
-          if((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))   // settling time reached
-          {
-            flowTickDuration = (flowTickStart - flowTickPrev);
-            if(once)                                                // only execute once per zone
+          if((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))   // settling time is time needed to reach a
+          {                                                            // steady pulse without sudden inrush volume
+            millisElapsed = (millisStart - millisPrev);
+            if(once)                                                   // only execute once per zone
             {
               once = false;
-              flowPreMeasureCount = flowPulseCount;                    // save count
+              flowPreMeasurePulseCount = flowPulseCount;               // save count
               flowPulseCount = 1;
               runningTotGPM = 0;
               runningTotPressure = currentPressure;
-              DEBUG_PRINTF("\nFLOW MEASUREMENT STARTED, %d gallons flowed pre-measurement\n", flowPreMeasureCount);
+              DEBUG_PRINTF("\nFLOW MEASUREMENT STARTED, %d gallons flowed during pre-measurement settling time\n", flowPreMeasurePulseCount);
             }
             
-            if (flowTickDuration > 0)                    // flowTickPrev is zero on 1st time thru
+            //if (millisElapsed > 0)                    // millisPrev is zero on 1st time thru
+            if (millisPrev > 0)                        // millisPrev is zero on 1st time thru
             {
-              instantGPM = (60 * 1000)/flowTickDuration;  // instantaneos gallons per minute
+              instantGPM = (60 * 1000)/millisElapsed;  // instantaneos gallons per minute
               if (instantGPM > maxGPM)
                 maxGPM = instantGPM;
               runningTotGPM = runningTotGPM + instantGPM;
               avgGPM = runningTotGPM/flowPulseCount;
-              zoneData[valveThisFlowTick].averageGPM = avgGPM;
-              zoneData[valveThisFlowTick].maxGPM = maxGPM;
-              zoneData[valveThisFlowTick].valveNum = valveThisFlowTick;
-              zoneData[valveThisFlowTick].measuredZoneGallons = flowPulseCount;
-              zoneData[valveThisFlowTick].preMeasureGallons = flowPreMeasureCount;
-              zoneData[valveThisFlowTick].averagePSI = avgPressure;
-              zoneData[valveThisFlowTick].maxPSI = maxPressure;
-              zoneData[valveThisFlowTick].minPSI = minPressure;
-              zoneData[valveThisFlowTick].waterTemperature = readPressureSensor(READ_TEMPERATURE);
+              zoneData[valveThisFlowPulse].averageGPM = avgGPM;
+              zoneData[valveThisFlowPulse].maxGPM = maxGPM;
+              zoneData[valveThisFlowPulse].valveNum = valveThisFlowPulse;
+              zoneData[valveThisFlowPulse].measuredZoneGallons = flowPulseCount;
+              zoneData[valveThisFlowPulse].preMeasureGallons = flowPreMeasurePulseCount * FLOW_GALS_PER_PULSE;
+              zoneData[valveThisFlowPulse].averagePSI = avgPressure;
+              zoneData[valveThisFlowPulse].maxPSI = maxPressure;
+              zoneData[valveThisFlowPulse].minPSI = minPressure;
+              zoneData[valveThisFlowPulse].waterTemperature = readPressureSensor(READ_TEMPERATURE);
             }
 
-            DEBUG_PRINTF("valveThisFlowTick = %d  flowPulseCount = %d, currentPressure =  %.2f avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  runningTotPressure = %.2f\n",
-                         valveThisFlowTick, flowPulseCount, currentPressure, avgPressure, maxPressure, minPressure, runningTotPressure);
-            DEBUG_PRINTF("                  flowTickDuration = %lu instantGPM = %.2f  avgGPM = %.2f  runningTotGPM = %.2f \n", flowTickDuration, instantGPM, avgGPM, runningTotGPM);
+            DEBUG_PRINTF("valveThisFlowPulse = %d  flowPulseCount = %d, currentPressure =  %.2f avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  runningTotPressure = %.2f\n",
+                         valveThisFlowPulse, flowPulseCount, currentPressure, avgPressure, maxPressure, minPressure, runningTotPressure);
+            DEBUG_PRINTF("                  millisElapsed = %lu instantGPM = %.2f  avgGPM = %.2f  runningTotGPM = %.2f \n", millisElapsed, instantGPM, avgGPM, runningTotGPM);
           }
 
-          flowTickPrev = flowTickStart;
-          valveLastFlowTick = valveThisFlowTick;
+          millisPrev = millisStart;
+          valveLastFlowPulse = valveThisFlowPulse;
         } 
         else // flow signal is HIGH, do nothing except check for timeout & continue loop
         {
-          flowTickNow = millis();
-          if ((flowTickNow - flowTickStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // in case magnet stops on HIGH
+          millisNow = millis();
+          if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // in case magnet stops on HIGH
           {
             DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while active low FLOW_SENSOR_BLUE_PIN = HIGH"));
             exchangeComms(wakeup_reason);
@@ -369,8 +378,8 @@ void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
       
       // wait a bit for potential OTA & MQTT exchanges
       startTick = millis();
-      DEBUG_PRINTF("\nWaiting %d seconds for any OTA & MQTT traffic...\n", COMMS_EXCHANGE_SECS);
-      while ((millis() - startTick) < (COMMS_EXCHANGE_SECS * 1000))
+      DEBUG_PRINTF("\nWaiting %d seconds for any OTA & MQTT traffic...\n", COMMS_EXCHANGE_TIMEOUT_SECS);
+      while ((millis() - startTick) < (COMMS_EXCHANGE_TIMEOUT_SECS * 1000))
       {
         mqttClient.loop();
         digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
