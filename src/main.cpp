@@ -25,7 +25,6 @@
 #include <ezTime.h>
 
 // local definitions
-#include "esp_adc_cal.h"     // from LilyGo TZ example code
 #include "prototypes.h"
 #include "credentials.h"     // <<<<<<<  COMMENT THIS LINE OUT & ENTER YOUR CREDENTIALS BELOW - this contains stuff for my WIFI network, not yours
 
@@ -37,11 +36,11 @@
   #define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
   #define DEBUG_FLUSH(...) Serial.flush(__VA_ARGS__)
 #else
-  #define DEBUG_BEGIN(...) 
-  #define DEBUG_PRINT(...) 
-  #define DEBUG_PRINTLN(...) 
-  #define DEBUG_PRINTF(...) 
-  #define DEBUG_FLUSH(...) 
+  #define DEBUG_BEGIN(...)
+  #define DEBUG_PRINT(...)
+  #define DEBUG_PRINTLN(...)
+  #define DEBUG_PRINTF(...)
+  #define DEBUG_FLUSH(...)
 #endif
 
 // name the device
@@ -49,14 +48,11 @@
 
 // TIME SETTINGS
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
-#define TIMEZONE_EEPROM_OFFSET 0                     // location-to-timezone info - saved in case eztime server is down
 
-#define VERSION "Ver 0.2 build 2025.04.0"
+#define VERSION "Ver 0.3 build 2026.06.1"
 
 // GPIO PIN DEFINITIONS
-#define BAT_ADC_PIN 12
 #define BUILT_IN_LED_PIN 17
-#define SLEEP_INHIBIT_PIN 21
 
 #define VALVE_1_PIN 15
 #define VALVE_2_PIN 16
@@ -64,9 +60,9 @@
 #define VALVE_4_PIN 18
 
 #define FLOW_SENSOR_BLUE_PIN 9                       // Hunter HC100FLOW flow meter - ACTIVE LOW
-#define FLOW_SENSOR_RED_PIN 11                       // not used for wake since we can only use one ext0 source
+#define FLOW_SENSOR_RED_PIN 11
 
-#define I2C_SCL_PIN 13   
+#define I2C_SCL_PIN 13
 #define I2C_SDA_PIN 14
 #define PRESSURE_SENSOR_I2C_ADDR 0x28                // TE M3200 pressure sensor
 
@@ -74,26 +70,21 @@
 #define FLOW_GALS_PER_PULSE  1
 #define TOT_NUM_VALVES 4
 #define PRESSURE_SENSOR_INSTALLED 1
-#define PREFER_FAHRENHEIT 1  
+#define PREFER_FAHRENHEIT 1
 #define FLOW_SETTLE_SECS 10                          // wait for empty pipe to fill and settle - normally set to 35
-#define INACTIVITY_TIMEOUT_SECS 90                   // wait this long before sleeping after last watering zone - normally set to 90
-#define HEARTBEAT_SLEEP_SECS  3600                   // seconds of sleep between wellness check wakeups - normally set to 3600
-#define COMMS_EXCHANGE_TIMEOUT_SECS 180              // wait this long for comms exchange before sleeping
-#define uS_TO_S_FACTOR 1000000ULL                    // Conversion factor for micro seconds to seconds
+#define INACTIVITY_TIMEOUT_SECS 90                   // wait this long after last pulse before ending session - normally set to 90
+#define HEARTBEAT_SECS 3600                          // seconds between wellness check-in publishes - normally set to 3600
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
-#define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error (timestmap) is published if error condition true
+#define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
 
 // MQTT
 #define MQTT_MSG_BUFFER_SIZE 512                            // for MQTT message payload
 #define MQTT_MAX_TOPIC_SIZE 1024                            // max topic string size(can be up to 65535)
 #define MAX_MQTT_CONNECT_ATTTEMPTS 10
 
-
 #define IRRIG_LWT_TOPIC "irrig_leak/status/LWT"             // MQTT Last Will & Testament
 #define IRRIG_VERSION_TOPIC "irrig_leak/version"            // report software version at connect
 #define IRRIG_WIFI_STRENGTH_TOPIC "irrig_leak/wifi_dbm"
-#define IRRIG_BATTERY_VOLTS_TOPIC "irrig_leak/battery_volts"
-#define IRRIG_BATTERY_PERCENT_TOPIC "irrig_leak/battery_percent"
 #define IRRIG_IDLE_TIME_STAMP_TOPIC "irrig_leak/idle/time_stamp"
 #define IRRIG_IDLE_PRESSURE_TOPIC "irrig_leak/idle/water_pressure"
 #define IRRIG_IDLE_WATER_TEMPERATURE_TOPIC "irrig_leak/idle/water_temperature"
@@ -109,8 +100,6 @@
 #define READ_TEMPERATURE 0
 #define READ_PRESSURE 1
 
-RTC_DATA_ATTR int wakeup_level;                        // this is stored in RTC memory so it lasts through sleep
-
 struct ZoneSummary
 {
   u_int valveNum;
@@ -122,7 +111,6 @@ struct ZoneSummary
   float maxPSI;
   float minPSI;
   float waterTemperature;
-//  byte filler;                                       // NVM requires even number of bytes for storage - uncomment only if necessary
 };
 
 WiFiClient espClient;
@@ -135,20 +123,55 @@ struct ZoneSummary zoneData[TOT_NUM_VALVES+1];           // array to keep flow d
 
 uint32_t blinkMillis = 0;
 int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
-esp_sleep_wakeup_cause_t wakeup_reason;
 unsigned long lastReconnectAttempt = 0;
-unsigned long lastPublish = 0, pressureLastRead = 0, lastValveSync = 0, lastPressErrReport = 0;
-unsigned long millisNow, millisStart, millisPrev = 0, startSettling, millisElapsed;
-bool flowSettled = false;
-unsigned long tempNow, lastPublishNow, pressureReadNow, mqttNow, lastPressErrReportNow;
+unsigned long lastPublish = 0, pressureLastRead = 0, lastPressErrReport = 0;
+unsigned long millisNow, millisStart = 0, millisPrev = 0, startSettling, millisElapsed;
+unsigned long pressureReadNow, mqttNow, lastPressErrReportNow;
 byte sensorStatus;
-float psiTminus0 = 0, psiTminus1 = 0, psiTminus2 = 0;         // psiTminus0 is the current pressure, psiTminus1 is the previous, psiTminus2 is the one before
-float avgPressure, maxPressure, minPressure, currentPressure, temperature, runningTotPressure = 0; 
-float instantGPM = 0, runningTotGPM = 0, avgGPM, maxGPM; 
-unsigned int flowPulseCount = 0, flowPreMeasurePulseCount = 0;;                             // one pulse = one gallon
+float psiTminus0 = 0, psiTminus1 = 0, psiTminus2 = 0;
+float avgPressure, maxPressure, minPressure, currentPressure, temperature, runningTotPressure = 0;
+float instantGPM = 0, runningTotGPM = 0, avgGPM, maxGPM;
+unsigned int flowPulseCount = 0, flowPreMeasurePulseCount = 0;
 unsigned int pressureReadInterval;
 bool once;
 
+bool sessionActive = false;
+unsigned long lastHeartbeatMs = 0;
+
+
+/*
+ * resetSessionData - clears per-irrigation-session accumulators
+ */
+void resetSessionData()
+{
+  memset(zoneData, 0, sizeof(zoneData));
+  flowPulseCount = 0;
+  flowPreMeasurePulseCount = 0;
+  millisElapsed = 0;
+  millisPrev = 0;
+  avgPressure = 0;
+  maxPressure = 0;
+  minPressure = 0;
+  runningTotPressure = 0;
+  avgGPM = 0;
+  runningTotGPM = 0;
+  instantGPM = 0;
+  valveLastFlowPulse = -1;
+  once = false;
+}
+
+
+/*
+ * publishSessionReport - send end-of-session data to MQTT broker
+ */
+void publishSessionReport()
+{
+  mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
+  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+  sendTotalsReport();
+  resetSessionData();
+  millisStart = millis();  // reset so inactivity timeout doesn't re-fire immediately
+}
 
 
 /**********************
@@ -165,250 +188,180 @@ void setup()
   pinMode(FLOW_SENSOR_BLUE_PIN, INPUT);       // flow inputs are
   pinMode(FLOW_SENSOR_RED_PIN, INPUT);        // active low w external pullup
   pinMode(BUILT_IN_LED_PIN, OUTPUT);
-  pinMode(SLEEP_INHIBIT_PIN, INPUT_PULLUP);   // active low
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
   DEBUG_PRINTF("\n\n\nIrrigation Leak Detector %s\n", VERSION);
+  DEBUG_PRINTLN("Size of struct ZoneSummary = " + String(sizeof(ZoneSummary)));
 
+  digitalWrite(BUILT_IN_LED_PIN, HIGH);       // LED on during init
 
-  digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
+  resetSessionData();
+  millisStart = millis();
 
-  DEBUG_PRINTLN("Size of struct ZoneSummary = " + String(sizeof(ZoneSummary)));    // anything written to flash must be even number of bytes
-  
-  if (digitalRead(SLEEP_INHIBIT_PIN) == LOW)
-  {
-    DEBUG_PRINTLN("\nSleep inhibit PIN active\n--------------------------------\n");
-    wakeup_reason = ESP_SLEEP_WAKEUP_EXT0;   // simulate this so loop will run
-  }
-  else
-    wakeup_reason = esp_sleep_get_wakeup_cause();
+  setup_wifi();
+  setup_OTA();
+  waitForSync();  // sync the time; ezTime will re-sync periodically on its own schedule
+  myTZ.setLocation(F(MY_TIMEZONE));
+  DEBUG_PRINTF("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
+  connectMQTT();
 
-  digitalWrite(BUILT_IN_LED_PIN, HIGH);             // LED on
-  flowPulseCount = 0;
-  millisElapsed = 0;
-  millisPrev = 0;
-  avgPressure = 0;
-  maxPressure = 0;
-  minPressure = 0;
-  runningTotPressure = 0;
-  avgGPM = 0;
-  runningTotGPM = 0;
-  instantGPM = 0;
-  startSettling = millis();
+  mqttClient.publish(IRRIG_VERSION_TOPIC, VERSION, true);
+  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VERSION_TOPIC, VERSION);
 
-  switch (wakeup_reason)
-  {
-    case ESP_SLEEP_WAKEUP_EXT0:                                              // external interrupt wakeup
-    {
-      print_wakeup_reason(wakeup_reason);
+  sprintf(mqttMsg, "%d", WiFi.RSSI());
+  mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
+  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg);
 
-      // LOOP UNTIL IRRIGATION IS DONE
-      while (true)
-      {
-        if (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)                        // pulse is active when LOW
-        {
-          currentPressure = readPressureSensor(READ_PRESSURE);               // read pressure each loop & record min & max
-          if (maxPressure < currentPressure)
-            maxPressure = currentPressure;
-          if (minPressure > currentPressure)
-            minPressure = currentPressure;
-          valveThisFlowPulse = getActiveValve();
-          if (valveThisFlowPulse != valveLastFlowPulse)                      // if zone has changed
-          {
-            once = true;
-            startSettling = millis();
-            flowPulseCount = 1;
-            flowPreMeasurePulseCount = 0;                                    // initialize variables
-            avgPressure = currentPressure;
-            maxPressure = currentPressure;
-            minPressure = currentPressure;
-            runningTotPressure = currentPressure;
-            instantGPM = 0;
-            maxGPM = 0;
-            avgGPM = 0;
-            runningTotGPM = 0;
-          }
-          else
-          {
-            flowPulseCount++;
-            runningTotPressure = runningTotPressure + currentPressure;
-            avgPressure = runningTotPressure/flowPulseCount;
-          }
-
-          millisStart = millis();                              // establish start time
-
-          digitalWrite(BUILT_IN_LED_PIN, HIGH);                // LED on
-          while(digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)      // wait for pulse to go low
-          {
-            millisNow = millis();
-            if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))   // in case magnet stops on LOW
-            { 
-              DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while active low FLOW_SENSOR_BLUE_PIN = LOW"));
-              exchangeComms(wakeup_reason);
-              GoToSleep();
-              break;             // break out of loop in case SLEEP_INHIBIT_PIN is set
-            }
-            yield();
-          }
-          digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
-
-          if((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))   // settling time is time needed to reach a
-          {                                                            // steady pulse without sudden inrush volume
-            millisElapsed = (millisStart - millisPrev);
-            if(once)                                                   // only execute once per zone
-            {
-              once = false;
-              flowPreMeasurePulseCount = flowPulseCount;               // save count
-              flowPulseCount = 1;
-              runningTotGPM = 0;
-              runningTotPressure = currentPressure;
-              DEBUG_PRINTF("\nFLOW MEASUREMENT STARTED, %d gallons flowed during pre-measurement settling time\n", flowPreMeasurePulseCount);
-            }
-            
-            //if (millisElapsed > 0)                    // millisPrev is zero on 1st time thru
-            if (millisPrev > 0)                        // millisPrev is zero on 1st time thru
-            {
-              instantGPM = (60 * 1000)/millisElapsed;  // instantaneos gallons per minute
-              if (instantGPM > maxGPM)
-                maxGPM = instantGPM;
-              runningTotGPM = runningTotGPM + instantGPM;
-              avgGPM = runningTotGPM/flowPulseCount;
-              zoneData[valveThisFlowPulse].averageGPM = avgGPM;
-              zoneData[valveThisFlowPulse].maxGPM = maxGPM;
-              zoneData[valveThisFlowPulse].valveNum = valveThisFlowPulse;
-              zoneData[valveThisFlowPulse].measuredZoneGallons = flowPulseCount;
-              zoneData[valveThisFlowPulse].preMeasureGallons = flowPreMeasurePulseCount * FLOW_GALS_PER_PULSE;
-              zoneData[valveThisFlowPulse].averagePSI = avgPressure;
-              zoneData[valveThisFlowPulse].maxPSI = maxPressure;
-              zoneData[valveThisFlowPulse].minPSI = minPressure;
-              zoneData[valveThisFlowPulse].waterTemperature = readPressureSensor(READ_TEMPERATURE);
-            }
-
-            DEBUG_PRINTF("valveThisFlowPulse = %d  flowPulseCount = %d, currentPressure =  %.2f avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  runningTotPressure = %.2f\n",
-                         valveThisFlowPulse, flowPulseCount, currentPressure, avgPressure, maxPressure, minPressure, runningTotPressure);
-            DEBUG_PRINTF("                  millisElapsed = %lu instantGPM = %.2f  avgGPM = %.2f  runningTotGPM = %.2f \n", millisElapsed, instantGPM, avgGPM, runningTotGPM);
-          }
-
-          millisPrev = millisStart;
-          valveLastFlowPulse = valveThisFlowPulse;
-        } 
-        else // flow signal is HIGH, do nothing except check for timeout & continue loop
-        {
-          millisNow = millis();
-          if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // in case magnet stops on HIGH
-          {
-            DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while active low FLOW_SENSOR_BLUE_PIN = HIGH"));
-            exchangeComms(wakeup_reason);
-            GoToSleep();
-            break;        // break out of loop in case SLEEP_INHIBIT_PIN is set
-          }
-          yield();
-        }
-
-
-      }
-      break;
-    }
-  
-    case ESP_SLEEP_WAKEUP_TIMER:                                                // send idle time info and go back to sleep
-    {
-      // send wellness check-in info to MQTT
-      print_wakeup_reason(wakeup_reason);
-      DEBUG_PRINTF("Awakened on I/O level = %d\n", wakeup_level);
-      exchangeComms(wakeup_reason);
-      DEBUG_PRINTLN(F("--------------------------------\n"));
-      GoToSleep();
-      break;
-    }
-
-    default: 
-      print_wakeup_reason(wakeup_reason);
-  }
-
-  DEBUG_PRINTLN(F("SHOULD NEVER REACH THIS EXCEPT AT FIRST BOOT"));
-  GoToSleep();
+  lastHeartbeatMs = millis();
+  DEBUG_PRINTLN(F("\nSetup complete. Entering main loop."));
+  DEBUG_PRINTLN(F("================================\n"));
 }
 
-/*********************** 
+
+/***********************
  *       LOOP
  ***********************/
 void loop()
-{ }  // never reaches here }
+{
+  ArduinoOTA.handle();
 
+  // Reconnect WiFi if dropped
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    DEBUG_PRINTLN(F("WiFi lost, reconnecting..."));
+    setup_wifi();
+  }
 
+  // Reconnect MQTT if dropped
+  if (!mqttClient.connected())
+    connectMQTT();
+  mqttClient.loop();
+
+  // Periodic heartbeat
+  if ((unsigned long)(millis() - lastHeartbeatMs) >= (HEARTBEAT_SECS * 1000UL))
+  {
+    lastHeartbeatMs = millis();
+    DEBUG_PRINTLN(F("\n--- Heartbeat ---"));
+    mqttClient.publish(IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
+    DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+    sprintf(mqttMsg, "%d", WiFi.RSSI());
+    mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
+    sendPressureSensorStatus();
+  }
+
+  // Flow detection
+  if (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)   // pulse is active when LOW
+  {
+    if (!sessionActive)
+    {
+      sessionActive = true;
+      resetSessionData();
+      startSettling = millis();
+      DEBUG_PRINTLN(F("\n--- Irrigation session started ---"));
+    }
+
+    currentPressure = readPressureSensor(READ_PRESSURE);
+    if (maxPressure < currentPressure)
+      maxPressure = currentPressure;
+    if (minPressure > currentPressure)
+      minPressure = currentPressure;
+    valveThisFlowPulse = getActiveValve();
+
+    if (valveThisFlowPulse != valveLastFlowPulse)  // zone has changed
+    {
+      once = true;
+      startSettling = millis();
+      flowPulseCount = 1;
+      flowPreMeasurePulseCount = 0;
+      avgPressure = currentPressure;
+      maxPressure = currentPressure;
+      minPressure = currentPressure;
+      runningTotPressure = currentPressure;
+      instantGPM = 0;
+      maxGPM = 0;
+      avgGPM = 0;
+      runningTotGPM = 0;
+    }
+    else
+    {
+      flowPulseCount++;
+      runningTotPressure = runningTotPressure + currentPressure;
+      avgPressure = runningTotPressure / flowPulseCount;
+    }
+
+    millisStart = millis();
+
+    digitalWrite(BUILT_IN_LED_PIN, HIGH);                // LED on during pulse
+    while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)     // wait for pulse to end
+    {
+      millisNow = millis();
+      if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
+      {
+        DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW"));
+        publishSessionReport();
+        sessionActive = false;
+        return;
+      }
+      yield();
+    }
+    digitalWrite(BUILT_IN_LED_PIN, LOW);                 // LED off after pulse
+
+    if ((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))
+    {
+      millisElapsed = (millisStart - millisPrev);
+      if (once)
+      {
+        once = false;
+        flowPreMeasurePulseCount = flowPulseCount;
+        flowPulseCount = 1;
+        runningTotGPM = 0;
+        runningTotPressure = currentPressure;
+        DEBUG_PRINTF("\nFLOW MEASUREMENT STARTED, %d gallons flowed during pre-measurement settling time\n", flowPreMeasurePulseCount);
+      }
+
+      if (millisPrev > 0)
+      {
+        instantGPM = (60 * 1000) / millisElapsed;
+        if (instantGPM > maxGPM)
+          maxGPM = instantGPM;
+        runningTotGPM = runningTotGPM + instantGPM;
+        avgGPM = runningTotGPM / flowPulseCount;
+        zoneData[valveThisFlowPulse].averageGPM = avgGPM;
+        zoneData[valveThisFlowPulse].maxGPM = maxGPM;
+        zoneData[valveThisFlowPulse].valveNum = valveThisFlowPulse;
+        zoneData[valveThisFlowPulse].measuredZoneGallons = flowPulseCount;
+        zoneData[valveThisFlowPulse].preMeasureGallons = flowPreMeasurePulseCount * FLOW_GALS_PER_PULSE;
+        zoneData[valveThisFlowPulse].averagePSI = avgPressure;
+        zoneData[valveThisFlowPulse].maxPSI = maxPressure;
+        zoneData[valveThisFlowPulse].minPSI = minPressure;
+        zoneData[valveThisFlowPulse].waterTemperature = readPressureSensor(READ_TEMPERATURE);
+      }
+
+      DEBUG_PRINTF("valveThisFlowPulse = %d  flowPulseCount = %d, currentPressure =  %.2f avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  runningTotPressure = %.2f\n",
+                   valveThisFlowPulse, flowPulseCount, currentPressure, avgPressure, maxPressure, minPressure, runningTotPressure);
+      DEBUG_PRINTF("                  millisElapsed = %lu instantGPM = %.2f  avgGPM = %.2f  runningTotGPM = %.2f \n", millisElapsed, instantGPM, avgGPM, runningTotGPM);
+    }
+
+    millisPrev = millisStart;
+    valveLastFlowPulse = valveThisFlowPulse;
+  }
+  else  // no flow — check for session inactivity timeout
+  {
+    if (sessionActive && ((millis() - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000UL)))
+    {
+      DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS - irrigation session ended"));
+      publishSessionReport();
+      sessionActive = false;
+    }
+    yield();
+  }
+}
 
 
 /*********************************
  *        SUBROUTINES
  *********************************/
-
-/*
- * exchangeComms
- */
-void exchangeComms(esp_sleep_wakeup_cause_t w_reason)
-{
-  unsigned long startTick, pauseTick;
-
-  digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
-  setup_wifi();
-  setup_OTA();
-  waitForSync();  //sync the time
-  setInterval(0);  //do not periodically sync NTP
-  myTZ.setLocation(F(MY_TIMEZONE)); 
-  DEBUG_PRINTF("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
-  connectMQTT();
-
-  mqttClient.publish(IRRIG_VERSION_TOPIC, VERSION, true); // report firmware version
-  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VERSION_TOPIC, VERSION);
-
-  sprintf(mqttMsg, "%d", WiFi.RSSI());
-  mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
-  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC , mqttMsg);
-
-  switch (w_reason)
-  {
-    case ESP_SLEEP_WAKEUP_EXT0:
-    {
-      mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
-      DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
-
-      sendBatteryStatus();
-      sendTotalsReport();
-      
-      // wait a bit for potential OTA & MQTT exchanges
-      startTick = millis();
-      DEBUG_PRINTF("\nWaiting %d seconds for any OTA & MQTT traffic...\n", COMMS_EXCHANGE_TIMEOUT_SECS);
-      while ((millis() - startTick) < (COMMS_EXCHANGE_TIMEOUT_SECS * 1000))
-      {
-        mqttClient.loop();
-        digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
-        pauseTick = millis();
-        while( (millis() - pauseTick) < 400 );
-        digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
-        pauseTick = millis();
-        while( (millis() - pauseTick) < 200 );
-        ArduinoOTA.handle();                        // remember program never returns from OTA
-      }
-      
-      break;
-    }
-    case ESP_SLEEP_WAKEUP_TIMER:
-    {
-      mqttClient.publish(IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
-      DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
-      
-      sendBatteryStatus();
-      sendPressureSensorStatus();
-      
-      break;
-    }
-    default:
-      DEBUG_PRINTF("WAKE REASON = %d - NO COMMS EXCHANGED\n", w_reason);
-  }
-  return;
-}
-
 
 /*
  * setup_wifi
@@ -417,7 +370,7 @@ void setup_wifi()
 {
   u_int j;
   unsigned long pauseTick;
-  
+
   // Connect to a WiFi network
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(DEVICE_HOST_NAME);
@@ -426,22 +379,20 @@ void setup_wifi()
   DEBUG_PRINTLN(WiFi.macAddress());
 
   DEBUG_PRINT(F("\nWaiting for WiFi "));
-  while (WiFi.waitForConnectResult() != WL_CONNECTED)   // connection happens in a different thread - just waiting for results here
+  while (WiFi.waitForConnectResult() != WL_CONNECTED)
   {
     DEBUG_PRINT(F("."));
-    for(j=0; j<90; j++)     // blink LED for 90s while trying to connect
+    for (j = 0; j < 90; j++)     // blink LED for 90s while trying to connect
     {
-      digitalWrite(BUILT_IN_LED_PIN, LOW);        // LED off
+      digitalWrite(BUILT_IN_LED_PIN, LOW);
       pauseTick = millis();
-      while( (millis() - pauseTick) < 500 );
-      digitalWrite(BUILT_IN_LED_PIN, HIGH);        // LED on
+      while ((millis() - pauseTick) < 500);
+      digitalWrite(BUILT_IN_LED_PIN, HIGH);
       pauseTick = millis();
-      while( (millis() - pauseTick) < 500 );
+      while ((millis() - pauseTick) < 500);
     }
-    ESP.restart();   // restart effectively starts sleep mode (initial state) & all data is lost
+    ESP.restart();
   }
-
-  //randomSeed(micros());
 
   DEBUG_PRINTLN(F(""));
   DEBUG_PRINT(F("WiFi connected to "));
@@ -452,22 +403,11 @@ void setup_wifi()
 
 
 /*
- * setupOTA
+ * setup_OTA
  */
 void setup_OTA()
 {
-  // Port defaults to 8266
-  //  ArduinoOTA.setPort(8266);
-
-  // Hostname defaults to esp8266-[ChipID]
   ArduinoOTA.setHostname(DEVICE_HOST_NAME);
-
-  // No authentication by default
-  // ArduinoOTA.setPassword("admin");
-
-  // Password can be set with it's md5 value as well
-  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
-  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
 
   ArduinoOTA.onStart([]() {
     String type;
@@ -475,8 +415,6 @@ void setup_OTA()
       type = "sketch";
     else
       type = "filesystem";  // U_FS
-
-    // NOTE: if updating FS this is the place to unmount FS using FS.end()
 
     DEBUG_PRINTLN("OTA Start updating " + type);
   });
@@ -502,6 +440,7 @@ void setup_OTA()
   ArduinoOTA.begin();
 }
 
+
 /*
  * connectMQTT
  */
@@ -511,7 +450,7 @@ void connectMQTT()
   mqttClient.setBufferSize(MQTT_MSG_BUFFER_SIZE);
   mqttClient.setServer(MQTT_SERVER, 1883);
   mqttClient.setCallback(callback);
-  while(connectAttemptCount < MAX_MQTT_CONNECT_ATTTEMPTS)
+  while (connectAttemptCount < MAX_MQTT_CONNECT_ATTTEMPTS)
   {
     if (!mqttClient.connected())
     {
@@ -521,10 +460,9 @@ void connectMQTT()
         Serial.printf("[%s] Waiting for MQTT...\n", myTZ.dateTime(RFC3339).c_str());
         lastReconnectAttempt = mqttNow;
         connectAttemptCount++;
-        // Attempt to reconnect
         if (reconnect())
         {
-          mqttClient.publish(IRRIG_LWT_TOPIC, "Connected", true); // let broker know we're connected
+          mqttClient.publish(IRRIG_LWT_TOPIC, "Connected", true);
           DEBUG_PRINTF("\n%s MQTT SENT: %s/Connected\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_LWT_TOPIC);
           lastReconnectAttempt = 0;
           return;
@@ -535,25 +473,23 @@ void connectMQTT()
   DEBUG_PRINTLN("ERROR-----Max MQTT connect attempts exceeded");
 }
 
+
 /*
  * MQTT callback
  */
 void callback(char *topic, byte *payload, unsigned int length)
 {
-  // handle MQTT message arrival
-  bool cmdValid = false;
   strncpy(mqttMsg, (char *)payload, length);
-  mqttMsg[length] = (char)NULL; // terminate the string
+  mqttMsg[length] = (char)NULL;
   DEBUG_PRINTF("\n%s MQTT RECVD: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), topic, mqttMsg);
 }
+
 
 /*
  * MQTT reconnect
  */
 boolean reconnect()
 {
-
-  // PubSubClient::connect(const char *id, const char *user, const char *pass, const char* willTopic, uint8_t willQos, boolean willRetain, const char* willMessage)
   if (mqttClient.connect(DEVICE_HOST_NAME, MQTT_USER_NAME, MQTT_PASSWORD, IRRIG_LWT_TOPIC, 2, true, "Disconnected"))
   {
     DEBUG_PRINT(F("MQTT connected to "));
@@ -564,49 +500,47 @@ boolean reconnect()
 
 
 /*
- * sendTotals
+ * sendTotalsReport
  */
 void sendTotalsReport()
 {
   int i;
   unsigned int valveOffLeakGals = 0, galsAllZones = 0;
 
-  for(i=0; i<(TOT_NUM_VALVES+1); i++)
+  for (i = 0; i < (TOT_NUM_VALVES + 1); i++)
   {
     // send GPM
     sprintf(mqttTopic, "%s_%d", IRRIG_GPM_TOPIC_PREFIX, i);
-
     sprintf(mqttMsg, "%.2f", zoneData[i].averageGPM);
-    mqttClient.publish(mqttTopic, mqttMsg, true);       // send average GPM
+    mqttClient.publish(mqttTopic, mqttMsg, true);
     DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-    sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"preMeasureGallons\": \"%d\", \"measuredZoneGallons\": \"%d\", \"maxGPM\": \"%.2f\"}", 
-                       zoneData[i].valveNum, zoneData[i].preMeasureGallons, zoneData[i].measuredZoneGallons, zoneData[i].maxGPM);
+    sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"preMeasureGallons\": \"%d\", \"measuredZoneGallons\": \"%d\", \"maxGPM\": \"%.2f\"}",
+                     zoneData[i].valveNum, zoneData[i].preMeasureGallons, zoneData[i].measuredZoneGallons, zoneData[i].maxGPM);
     sprintf(mqttTopic, "%s_%d%s", IRRIG_GPM_TOPIC_PREFIX, i, "/attributes");
     mqttClient.publish(mqttTopic, mqttMsg, true);
     DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
     // send PSI & temperature
     sprintf(mqttTopic, "%s_%d", IRRIG_PSI_TOPIC_PREFIX, i);
-
     sprintf(mqttMsg, "%.2f", zoneData[i].averagePSI);
-    mqttClient.publish(mqttTopic, mqttMsg, true);       // send average PSI
+    mqttClient.publish(mqttTopic, mqttMsg, true);
     DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-    sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\", \"waterTemperature\": \"%.2f\"}", 
-                       zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI, zoneData[i].waterTemperature);
+    sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\", \"waterTemperature\": \"%.2f\"}",
+                     zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI, zoneData[i].waterTemperature);
     sprintf(mqttTopic, "%s_%d%s", IRRIG_PSI_TOPIC_PREFIX, i, "/attributes");
     mqttClient.publish(mqttTopic, mqttMsg, true);
     DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
     galsAllZones = galsAllZones + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
 
-    if (zoneData[i].valveNum == 0)   // valNum == 0 means no valves are ON, so any flow must be leak
-      valveOffLeakGals = valveOffLeakGals + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;  // accumulate leak gals
+    if (zoneData[i].valveNum == 0)  // valNum == 0 means no valves ON, so any flow must be a leak
+      valveOffLeakGals = valveOffLeakGals + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
   }
 
   sprintf(mqttMsg, "%d", galsAllZones);
-  mqttClient.publish(IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC , mqttMsg, true);
+  mqttClient.publish(IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg, true);
   DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg);
 
   if (valveOffLeakGals > 0)
@@ -620,13 +554,14 @@ void sendTotalsReport()
     DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, "0");
 }
 
+
 /*
  * sendPressureSensorStatus
  */
 void sendPressureSensorStatus()
 {
   float idleWaterPressure, idleWaterTemperature;
-  
+
   if (PRESSURE_SENSOR_INSTALLED)
   {
     idleWaterPressure = readPressureSensor(READ_PRESSURE);
@@ -640,67 +575,11 @@ void sendPressureSensorStatus()
   }
 }
 
-/*
- * sendBatteryStatus
- */
-void sendBatteryStatus()
-{
-  float voltage = 0.0;
-  uint8_t percentage = 0;
-
-  voltage = ((float)((readADC_Cal(analogRead(BAT_ADC_PIN))) * 2))/1000;
-
-  percentage = 2836.9625 * pow(voltage, 4) - 43987.4889 * pow(voltage, 3) + 255233.8134 * pow(voltage, 2) - 656689.7123 * voltage + 632041.7303;
-  if (voltage >= 4.20) percentage = 100;
-  if (voltage <= 3.30) percentage = 0;  // orig 3.5
-  
-  sprintf(mqttMsg, "%.2f", voltage);
-  mqttClient.publish(IRRIG_BATTERY_VOLTS_TOPIC, mqttMsg, true);  
-  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_BATTERY_VOLTS_TOPIC, mqttMsg);
-  sprintf(mqttMsg, "%d", percentage);
-  mqttClient.publish(IRRIG_BATTERY_PERCENT_TOPIC, mqttMsg, true);  
-  DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_BATTERY_PERCENT_TOPIC, mqttMsg);
-}
-
-/*
- * GoToSleep
- */
-void GoToSleep()
-{
-    if(digitalRead(SLEEP_INHIBIT_PIN) == HIGH)  // if sleep not inhibited (active low)
-    {
-      // First we configure when to wakeup next
-      digitalWrite(BUILT_IN_LED_PIN, LOW);
-      esp_sleep_enable_timer_wakeup(HEARTBEAT_SLEEP_SECS * uS_TO_S_FACTOR);          // periodic wellness checkin
-      wakeup_level = (!digitalRead(FLOW_SENSOR_BLUE_PIN));                               // set new wakeup level to opposite of current
-      esp_sleep_enable_ext0_wakeup((gpio_num_t)FLOW_SENSOR_BLUE_PIN, wakeup_level);      // wake if state changes
-      DEBUG_PRINTF("%s Going to sleep now for %ds. Will wake on I/O level %d\nZzzz Zzzz Zzzz Zzzz Zzzz Zzzz Zzzz Zzzz Zzzz Zzzz Zzzz Zzzz\n\n", 
-                    myTZ.dateTime("[H:i:s.v]").c_str(), HEARTBEAT_SLEEP_SECS, wakeup_level);
-      DEBUG_FLUSH();
-      esp_deep_sleep_start();
-      DEBUG_PRINTLN(F("This will never be printed"));
-    }
-    else
-      yield();
-}
-
-
-/*
- * readADC_Cal
- */
-uint32_t readADC_Cal(int ADC_Raw)
-{
-  esp_adc_cal_characteristics_t adc_chars;
-
-  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
-  return (esp_adc_cal_raw_to_voltage(ADC_Raw, &adc_chars));
-}
-
 
 /*
  * getActiveValve
  */
-int getActiveValve()                     // zero is the first valve/zone
+int getActiveValve()                     // zero means no valve is active
 {
   if (digitalRead(VALVE_1_PIN) == HIGH)
     return(1);
@@ -715,52 +594,10 @@ int getActiveValve()                     // zero is the first valve/zone
 
 
 /*
- * print_wake_reason
- */
-void print_wakeup_reason(esp_sleep_wakeup_cause_t w_reason)
-{
-  switch (w_reason) {
-    case ESP_SLEEP_WAKEUP_EXT0 : 
-    {
-      DEBUG_PRINTLN(F("\nWAKEUP CAUSED BY EXTERNAL SIGNAL USING RTC_IO"));
-      DEBUG_PRINTF("Awakened on I/O level = %d\n", wakeup_level);
-      break;
-    }
-    case ESP_SLEEP_WAKEUP_EXT1 :
-    {
-      DEBUG_PRINTLN(F("\nWAKEUP CAUSED BY EXTERNAL SIGNAL USING RTC_CNTL"));
-      break;
-    }
-    case ESP_SLEEP_WAKEUP_TIMER :
-    {
-      DEBUG_PRINTLN(F("\nWAKEUP CAUSED BY TIMER"));
-      break;
-    }
-    case ESP_SLEEP_WAKEUP_TOUCHPAD :
-    {
-      DEBUG_PRINTLN(F("\nERROR - WAKEUP CAUSED BY TOUCHPAD - ERROR"));
-      break;
-    }
-    case ESP_SLEEP_WAKEUP_ULP :
-    {
-      DEBUG_PRINTLN(F("\nERROR - WAKEUP CAUSED BY ULP PROGRAM - ERROR"));
-      break;
-    }
-    default :
-    {
-      DEBUG_PRINTF("\nWAKEUP CAUSED BY DEEP SLEEP: %d\n", w_reason);
-      break;
-    }
-  }
-}
-
-
-/*
  * readPressureSensor
  */
 float readPressureSensor(int pressOrtemp)
 {
-  // Read sensor
   if (PRESSURE_SENSOR_INSTALLED)
   {
     sensorStatus = 0xFF; // set to non-zero for initial while() test
@@ -770,25 +607,25 @@ float readPressureSensor(int pressOrtemp)
       pressureLastRead = millis();
       while (sensorStatus != 0) // continue reading until valid
       {
-        Wire.requestFrom(PRESSURE_SENSOR_I2C_ADDR, 4); // request 4 bytes  - if optional 3rd argument false = don't share i2c bus
+        Wire.requestFrom(PRESSURE_SENSOR_I2C_ADDR, 4);
         int n = Wire.available();
         if (n == 4)
         {
-          sensorStatus = 0;  // set to zero to exit while loop when read is successful
-          uint16_t rawP; // pressure data from sensor
-          uint16_t rawT; // temperature data from sensor
+          sensorStatus = 0;
+          uint16_t rawP;
+          uint16_t rawT;
 
-          rawP = (uint16_t)Wire.read(); // upper 8 bits
+          rawP = (uint16_t)Wire.read();
           rawP <<= 8;
-          rawP |= (uint16_t)Wire.read(); // lower 8 bits
-          rawT = (uint16_t)Wire.read();  // upper 8 bits
+          rawP |= (uint16_t)Wire.read();
+          rawT = (uint16_t)Wire.read();
           rawT <<= 8;
-          rawT |= (uint16_t)Wire.read(); // lower 8 bits
+          rawT |= (uint16_t)Wire.read();
 
-          sensorStatus = rawP >> 14; // The status is 0, 1, 2 or 3
-          rawP &= 0x3FFF;            // keep 14 bits, remove status bits
+          sensorStatus = rawP >> 14;
+          rawP &= 0x3FFF;
 
-          rawT >>= 5; // the lowest 5 bits are not used
+          rawT >>= 5;
 
           psiTminus0 = ((rawP - 1000.0) / (15000.0 - 1000.0)) * MAX_PRESSURE;
           temperature = ((rawT - 512.0) / (1075.0 - 512.0)) * 55.0;
@@ -799,17 +636,14 @@ float readPressureSensor(int pressOrtemp)
           if ((unsigned long)(lastPressErrReportNow - lastPressErrReport) > (unsigned long)PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
           {
             DEBUG_PRINTLN(F("Error reading pressure sensor"));
-            // mqttClient.publish(PRESSURE_SENSOR_FAULT_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
-            // DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), PRESSURE_SENSOR_FAULT_TOPIC, myTZ.dateTime(RFC3339).c_str());
             lastPressErrReport = millis();
           }
-          while ((millis() - lastPressErrReportNow) < pressureReadInterval)   // prevent cycling too fast
+          while ((millis() - lastPressErrReportNow) < pressureReadInterval)
             yield();
           break;
         }
       }
     }
-
   }
   else
     return(0);
@@ -817,7 +651,7 @@ float readPressureSensor(int pressOrtemp)
   if (pressOrtemp == READ_TEMPERATURE)
   {
     if (PREFER_FAHRENHEIT)
-      return( (temperature * 9/5) + 32 );
+      return((temperature * 9 / 5) + 32);
     else
       return(temperature);
   }
