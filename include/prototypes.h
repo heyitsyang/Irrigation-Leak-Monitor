@@ -15,5 +15,4 @@ void publishSessionReport();
 int getActiveValve();
 void sendTotalsReport();
 void sendPressureSensorStatus();
-void sendBatteryStatus();
 float readPressureSensor(int pressOrtemp);

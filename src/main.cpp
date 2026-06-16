@@ -8,16 +8,12 @@
 #ifdef ESP32
   #include <WiFi.h>
   #include <WiFiMulti.h>
-  #include <ESPmDNS.h>
 #else
   #include <ESP8266WiFi.h>
-  #include <ESP8266mDNS.h>
 #endif
-#include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <Wire.h>
 // add the below libraries from the Library Manager
-//#include <TelnetStream.h>
 #include <PubSubClient.h>
 #include <ezTime.h>
 
@@ -73,6 +69,7 @@
 #define HEARTBEAT_SECS 3600                          // seconds between wellness check-in publishes - normally set to 3600
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
+#define PRESSURE_READ_INTERVAL_MS 0                   // minimum ms between I2C reads (0 = read every call)
 
 // MQTT
 #define MQTT_MSG_BUFFER_SIZE 512                            // for MQTT message payload
@@ -123,19 +120,17 @@ char mqttMsg[MQTT_MSG_BUFFER_SIZE];
 char mqttTopic[MQTT_MAX_TOPIC_SIZE];
 struct ZoneSummary zoneData[TOT_NUM_VALVES+1];           // array to keep flow data
 
-uint32_t blinkMillis = 0;
 int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
 unsigned long lastReconnectAttempt = 0;
-unsigned long lastPublish = 0, pressureLastRead = 0, lastPressErrReport = 0;
+unsigned long pressureLastRead = 0, lastPressErrReport = 0;
 unsigned long millisNow, millisStart = 0, millisPrev = 0, startSettling, millisElapsed;
 unsigned long zoneStartMs = 0;
 unsigned long pressureReadNow, mqttNow, lastPressErrReportNow;
 byte sensorStatus;
-float psiTminus0 = 0, psiTminus1 = 0, psiTminus2 = 0;
+float psiTminus0 = 0;
 float avgPressure, maxPressure, minPressure, currentPressure, temperature, runningTotPressure = 0;
 float instantGPM = 0, runningTotGPM = 0, avgGPM, maxGPM;
 unsigned int flowPulseCount = 0, flowPreMeasurePulseCount = 0;
-unsigned int pressureReadInterval;
 bool once;
 
 bool sessionActive = false;
@@ -711,7 +706,7 @@ float readPressureSensor(int pressOrtemp)
   {
     sensorStatus = 0xFF; // set to non-zero for initial while() test
     pressureReadNow = millis();
-    if ((unsigned long)(pressureReadNow - pressureLastRead) > pressureReadInterval)
+    if ((unsigned long)(pressureReadNow - pressureLastRead) > PRESSURE_READ_INTERVAL_MS)
     {
       pressureLastRead = millis();
       while (sensorStatus != 0) // continue reading until valid
@@ -747,7 +742,7 @@ float readPressureSensor(int pressOrtemp)
             DEBUG_PRINTLN(F("Error reading pressure sensor"));
             lastPressErrReport = millis();
           }
-          while ((millis() - lastPressErrReportNow) < pressureReadInterval)
+          while ((millis() - lastPressErrReportNow) < PRESSURE_READ_INTERVAL_MS)
             yield();
           break;
         }
