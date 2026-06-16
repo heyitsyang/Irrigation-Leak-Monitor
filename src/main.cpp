@@ -252,21 +252,19 @@ void loop()
 {
   ArduinoOTA.handle();
 
-  // Reconnect WiFi/MQTT if dropped; update LED on state change
+  // Reconnect WiFi/MQTT if dropped; LED driven at drop/connect events
+  if (WiFi.status() != WL_CONNECTED)
   {
-    bool wasConnected = connectedOK;
-    if (WiFi.status() != WL_CONNECTED)
-    {
-      DEBUG_PRINTLN(F("WiFi lost, reconnecting..."));
-      wifiMulti.run();
-    }
-    if (!mqttClient.connected())
-      connectMQTT();
-    mqttClient.loop();
-    connectedOK = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
-    if (connectedOK != wasConnected)
-      digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);
+    DEBUG_PRINTLN(F("WiFi lost, reconnecting..."));
+    if (connectedOK) { connectedOK = false; digitalWrite(BUILT_IN_LED_PIN, HIGH); }
+    wifiMulti.run();
   }
+  if (!mqttClient.connected())
+  {
+    if (connectedOK) { connectedOK = false; digitalWrite(BUILT_IN_LED_PIN, HIGH); }
+    connectMQTT();   // reconnect() inside sets connectedOK=true and LED LOW on success
+  }
+  mqttClient.loop();
 
   // Periodic heartbeat
   if ((unsigned long)(millis() - lastHeartbeatMs) >= (HEARTBEAT_SECS * 1000UL))
@@ -447,6 +445,14 @@ CandidateRSSI scanAndLogWifi()
   }
   WiFi.scanDelete();
 
+  // Synchronous scan can temporarily disconnect; yield until reconnected (or 5s timeout)
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    unsigned long recoveryStart = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - recoveryStart) < 5000)
+      yield();
+  }
+
   return result;
 }
 
@@ -576,6 +582,8 @@ boolean reconnect()
 {
   if (mqttClient.connect(DEVICE_HOST_NAME, MQTT_USER_NAME, MQTT_PASSWORD, IRRIG_LWT_TOPIC, 2, true, "Disconnected"))
   {
+    connectedOK = true;
+    digitalWrite(BUILT_IN_LED_PIN, LOW);    // LED OFF immediately on successful connect
     DEBUG_PRINT(F("MQTT connected to "));
     DEBUG_PRINTLN(F(MQTT_SERVER));
   }
