@@ -239,6 +239,14 @@ void setup()
     }
   }
 
+  // Initialize run duration topics to 0 so HA never shows Unknown on fresh boot
+  for (int i = 1; i <= TOT_NUM_VALVES; i++)
+  {
+    sprintf(mqttTopic, "%s_%d", IRRIG_RUN_DURATION_TOPIC_PREFIX, i);
+    mqttClient.publish(mqttTopic, "0", true);
+    DEBUG_PRINTF("%s MQTT SENT: %s/0\n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic);
+  }
+
   lastHeartbeatMs = millis();
   DEBUG_PRINTLN(F("\nSetup complete. Entering main loop."));
   DEBUG_PRINTLN(F("================================\n"));
