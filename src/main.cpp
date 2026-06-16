@@ -4,10 +4,6 @@
  *                          *
  ****************************/
 
-/* To Do List
-   - add watering duration for each zone to report
-*/
-
 #include <Arduino.h>
 #ifdef ESP32
   #include <WiFi.h>
@@ -97,10 +93,10 @@
 #define IRRIG_VALVES_OFF_LEAK_TOPIC "irrig_leak/report/valve_leak"  // flow sensed when all valves are off & there should be none
 #define IRRIG_GPM_TOPIC_PREFIX "irrig_leak/report/avg_gpm_zone"  // valve/zone number is appended to the end to create the complete topic
 #define IRRIG_PSI_TOPIC_PREFIX "irrig_leak/report/avg_psi_zone"  // valve/zone number is appended to the end to create the complete topic
+#define IRRIG_RUN_DURATION_TOPIC_PREFIX "irrig_leak/report/run_dur_zone"  // valve/zone number is appended to the end to create the complete topic
 
 #define IRRIG_RECV_COMMAND_TOPIC "irrig_leak/cmd/#"
-
-// MISC
+// MIS
 #define READ_TEMPERATURE 0
 #define READ_PRESSURE 1
 
@@ -115,6 +111,7 @@ struct ZoneSummary
   float maxPSI;
   float minPSI;
   float waterTemperature;
+  unsigned long runDurationMs;
 };
 
 WiFiClient espClient;
@@ -131,6 +128,7 @@ int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastPublish = 0, pressureLastRead = 0, lastPressErrReport = 0;
 unsigned long millisNow, millisStart = 0, millisPrev = 0, startSettling, millisElapsed;
+unsigned long zoneStartMs = 0;
 unsigned long pressureReadNow, mqttNow, lastPressErrReportNow;
 byte sensorStatus;
 float psiTminus0 = 0, psiTminus1 = 0, psiTminus2 = 0;
@@ -141,6 +139,7 @@ unsigned int pressureReadInterval;
 bool once;
 
 bool sessionActive = false;
+bool connectedOK = false;
 unsigned long lastHeartbeatMs = 0;
 
 
@@ -171,6 +170,8 @@ void resetSessionData()
  */
 void publishSessionReport()
 {
+  if (valveLastFlowPulse >= 0)
+    zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
   mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
   DEBUG_PRINTF("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
   sendTotalsReport();
@@ -210,6 +211,8 @@ void setup()
   myTZ.setLocation(F(MY_TIMEZONE));
   DEBUG_PRINTF("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
   connectMQTT();
+  connectedOK = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
+  digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);
 
   mqttClient.loop();  // keep connection alive after waitForSync() blocking call
   mqttClient.publish(IRRIG_VERSION_TOPIC, VERSION, true);
@@ -249,17 +252,21 @@ void loop()
 {
   ArduinoOTA.handle();
 
-  // Reconnect WiFi if dropped
-  if (WiFi.status() != WL_CONNECTED)
+  // Reconnect WiFi/MQTT if dropped; update LED on state change
   {
-    DEBUG_PRINTLN(F("WiFi lost, reconnecting..."));
-    wifiMulti.run();
+    bool wasConnected = connectedOK;
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      DEBUG_PRINTLN(F("WiFi lost, reconnecting..."));
+      wifiMulti.run();
+    }
+    if (!mqttClient.connected())
+      connectMQTT();
+    mqttClient.loop();
+    connectedOK = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
+    if (connectedOK != wasConnected)
+      digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);
   }
-
-  // Reconnect MQTT if dropped
-  if (!mqttClient.connected())
-    connectMQTT();
-  mqttClient.loop();
 
   // Periodic heartbeat
   if ((unsigned long)(millis() - lastHeartbeatMs) >= (HEARTBEAT_SECS * 1000UL))
@@ -298,6 +305,7 @@ void loop()
     {
       sessionActive = true;
       resetSessionData();
+      zoneStartMs = millis();
       startSettling = millis();
       DEBUG_PRINTLN(F("\n--- Irrigation session started ---"));
     }
@@ -311,6 +319,9 @@ void loop()
 
     if (valveThisFlowPulse != valveLastFlowPulse)  // zone has changed
     {
+      if (valveLastFlowPulse >= 0)
+        zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
+      zoneStartMs = millis();
       once = true;
       startSettling = millis();
       flowPulseCount = 1;
@@ -333,20 +344,30 @@ void loop()
 
     millisStart = millis();
 
-    digitalWrite(BUILT_IN_LED_PIN, HIGH);                // LED on during pulse
-    while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)     // wait for pulse to end
     {
-      millisNow = millis();
-      if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
+      unsigned long blinkStart = millis();
+      bool blinkActive = true;
+      digitalWrite(BUILT_IN_LED_PIN, connectedOK ? HIGH : LOW);   // blink state
+      while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)
       {
-        DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW"));
-        publishSessionReport();
-        sessionActive = false;
-        return;
+        millisNow = millis();
+        if (blinkActive && (millisNow - blinkStart) >= 500)
+        {
+          blinkActive = false;
+          digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);  // return to rest
+        }
+        if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
+        {
+          DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW"));
+          digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);  // restore rest state
+          publishSessionReport();
+          sessionActive = false;
+          return;
+        }
+        yield();
       }
-      yield();
+      digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);    // restore rest state
     }
-    digitalWrite(BUILT_IN_LED_PIN, LOW);                 // LED off after pulse
 
     if ((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))
     {
@@ -435,7 +456,6 @@ CandidateRSSI scanAndLogWifi()
  */
 void setup_wifi()
 {
-  u_int j;
   unsigned long pauseTick;
 
   WiFi.mode(WIFI_STA);
@@ -452,15 +472,9 @@ void setup_wifi()
   while (wifiMulti.run() != WL_CONNECTED)
   {
     DEBUG_PRINT(F("."));
-    for (j = 0; j < 90; j++)     // blink LED for 90s while trying to connect
-    {
-      digitalWrite(BUILT_IN_LED_PIN, LOW);
-      pauseTick = millis();
-      while ((millis() - pauseTick) < 500);
-      digitalWrite(BUILT_IN_LED_PIN, HIGH);
-      pauseTick = millis();
-      while ((millis() - pauseTick) < 500);
-    }
+    pauseTick = millis();
+    while ((millis() - pauseTick) < 90000)   // wait 90s solid-ON then restart
+      yield();
     ESP.restart();
   }
 
@@ -602,6 +616,15 @@ void sendTotalsReport()
     sprintf(mqttTopic, "%s_%d%s", IRRIG_PSI_TOPIC_PREFIX, i, "/attributes");
     mqttClient.publish(mqttTopic, mqttMsg, true);
     DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+
+    // send run duration (zones 1-4 only)
+    if (i > 0)
+    {
+      sprintf(mqttTopic, "%s_%d", IRRIG_RUN_DURATION_TOPIC_PREFIX, i);
+      sprintf(mqttMsg, "%.1f", zoneData[i].runDurationMs / 60000.0f);
+      mqttClient.publish(mqttTopic, mqttMsg, true);
+      DEBUG_PRINTF("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+    }
 
     galsAllZones = galsAllZones + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
 
