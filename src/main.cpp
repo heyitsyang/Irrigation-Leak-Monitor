@@ -16,6 +16,8 @@
 // add the below libraries from the Library Manager
 #include <PubSubClient.h>
 #include <ezTime.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSerial.h>
 
 // local definitions
 #include "prototypes.h"
@@ -81,7 +83,7 @@
 
 #define IRRIG_RECV_COMMAND_TOPIC "irrig_leak/cmd/#"
 // MIS
-#define READ_TEMPERATURE 0
+#define READ_TEMPERATURE 1
 #define READ_PRESSURE 1
 
 struct ZoneSummary
@@ -97,6 +99,8 @@ struct ZoneSummary
   float waterTemperature;
   unsigned long runDurationMs;
 };
+
+AsyncWebServer server(80);
 
 WiFiClient espClient;
 WiFiMulti wifiMulti;
@@ -126,7 +130,16 @@ bool connectedOK = false;
 unsigned long lastHeartbeatMs = 0;
 
 
-
+void LOG(const char* fmt, ...)
+{
+  char buf[512];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  WebSerial.print(buf);
+}
 
 
 /**********************
@@ -147,7 +160,7 @@ void setup()
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
   Serial.printf("\n\n\nIrrigation Leak Detector %s\n", VERSION);
-  Serial.println("Size of struct ZoneSummary = " + String(sizeof(ZoneSummary)));
+  Serial.printf("Size of struct ZoneSummary = %d\n", sizeof(ZoneSummary));
 
   digitalWrite(BUILT_IN_LED_PIN, HIGH);       // LED on during init
 
@@ -155,36 +168,38 @@ void setup()
   millisStart = millis();
 
   setup_wifi();
+  WebSerial.begin(&server);
+  server.begin();
   setup_OTA();
   waitForSync();  // sync the time; ezTime will re-sync periodically on its own schedule
   myTZ.setLocation(F(MY_TIMEZONE));
-  Serial.printf("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
+  LOG("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
   connectMQTT();
   connectedOK = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
   digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);
 
   mqttClient.loop();  // keep connection alive after waitForSync() blocking call
   mqttClient.publish(IRRIG_VERSION_TOPIC, VERSION, true);
-  Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VERSION_TOPIC, VERSION);
+  LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VERSION_TOPIC, VERSION);
 
   sprintf(mqttMsg, "%d", WiFi.RSSI());
   mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
-  Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg);
+  LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg);
 
   mqttClient.publish(IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str(), true);
-  Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str());
+  LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str());
 
   {
     CandidateRSSI candidates = scanAndLogWifi();
     if (candidates.primary != INT8_MIN) {
       sprintf(mqttMsg, "%d", candidates.primary);
       mqttClient.publish(IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg, true);
-      Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg);
+      LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg);
     }
     if (candidates.secondary != INT8_MIN) {
       sprintf(mqttMsg, "%d", candidates.secondary);
       mqttClient.publish(IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg, true);
-      Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg);
+      LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg);
     }
   }
 
@@ -193,12 +208,12 @@ void setup()
   {
     sprintf(mqttTopic, "%s_%d", IRRIG_RUN_DURATION_TOPIC_PREFIX, i);
     mqttClient.publish(mqttTopic, "0", true);
-    Serial.printf("%s MQTT SENT: %s/0\n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic);
+    LOG("%s MQTT SENT: %s/0\n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic);
   }
 
   lastHeartbeatMs = millis();
-  Serial.println(F("\nSetup complete. Entering main loop."));
-  Serial.println(F("================================\n"));
+  LOG("\nSetup complete. Entering main loop.\n");
+  LOG("================================\n\n");
 }
 
 
@@ -212,7 +227,7 @@ void loop()
   // Reconnect WiFi/MQTT if dropped; LED driven at drop/connect events
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println(F("WiFi lost, reconnecting..."));
+    LOG("WiFi lost, reconnecting...\n");
     if (connectedOK) { connectedOK = false; digitalWrite(BUILT_IN_LED_PIN, HIGH); }
     wifiMulti.run();
   }
@@ -227,26 +242,26 @@ void loop()
   if ((unsigned long)(millis() - lastHeartbeatMs) >= (HEARTBEAT_SECS * 1000UL))
   {
     lastHeartbeatMs = millis();
-    Serial.println(F("\n--- Heartbeat ---"));
+    LOG("\n--- Heartbeat ---\n");
     mqttClient.publish(IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
-    Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+    LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
     sprintf(mqttMsg, "%d", WiFi.RSSI());
     mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
 
     mqttClient.publish(IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str(), true);
-    Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str());
+    LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str());
 
     {
       CandidateRSSI candidates = scanAndLogWifi();
       if (candidates.primary != INT8_MIN) {
         sprintf(mqttMsg, "%d", candidates.primary);
         mqttClient.publish(IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg, true);
-        Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg);
+        LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg);
       }
       if (candidates.secondary != INT8_MIN) {
         sprintf(mqttMsg, "%d", candidates.secondary);
         mqttClient.publish(IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg, true);
-        Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg);
+        LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg);
       }
     }
 
@@ -262,7 +277,7 @@ void loop()
       resetSessionData();
       zoneStartMs = millis();
       startSettling = millis();
-      Serial.println(F("\n--- Irrigation session started ---"));
+      LOG("\n--- Irrigation session started ---\n");
     }
 
     currentPressure = readPressureSensor(READ_PRESSURE);
@@ -274,7 +289,7 @@ void loop()
 
     if (valveThisFlowPulse != valveLastFlowPulse)  // zone has changed
     {
-      Serial.printf("\nZone %d detected (was %d)\n", valveThisFlowPulse, valveLastFlowPulse);
+      LOG("\nZone %d detected (was %d)\n", valveThisFlowPulse, valveLastFlowPulse);
       if (valveLastFlowPulse >= 0)
         zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
       zoneStartMs = millis();
@@ -315,7 +330,7 @@ void loop()
         }
         if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
         {
-          Serial.println(F("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW"));
+          LOG("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW\n");
           digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);  // restore rest state
           sensorStuckUntilMs = millis() + (INACTIVITY_TIMEOUT_SECS * 1000UL);
           publishSessionReport();
@@ -337,7 +352,7 @@ void loop()
         flowPulseCount = 1;
         runningTotGPM = 0;
         runningTotPressure = currentPressure;
-        Serial.printf("\nFLOW MEASUREMENT STARTED, %d gallons flowed during pre-measurement settling time\n", flowPreMeasurePulseCount);
+        LOG("\nFLOW MEASUREMENT STARTED, %d gallons flowed during pre-measurement settling time\n", flowPreMeasurePulseCount);
       }
 
       if (millisPrev > 0)
@@ -358,9 +373,9 @@ void loop()
         zoneData[valveThisFlowPulse].waterTemperature = readPressureSensor(READ_TEMPERATURE);
       }
 
-      Serial.printf("valveThisFlowPulse = %d  flowPulseCount = %d, currentPressure =  %.2f avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  runningTotPressure = %.2f\n",
+      LOG("valveThisFlowPulse = %d  flowPulseCount = %d, currentPressure =  %.2f avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  runningTotPressure = %.2f\n",
                    valveThisFlowPulse, flowPulseCount, currentPressure, avgPressure, maxPressure, minPressure, runningTotPressure);
-      Serial.printf("                  millisElapsed = %lu instantGPM = %.2f  avgGPM = %.2f  runningTotGPM = %.2f \n", millisElapsed, instantGPM, avgGPM, runningTotGPM);
+      LOG("                  millisElapsed = %lu instantGPM = %.2f  avgGPM = %.2f  runningTotGPM = %.2f \n", millisElapsed, instantGPM, avgGPM, runningTotGPM);
     }
 
     millisPrev = millisStart;
@@ -370,7 +385,7 @@ void loop()
   {
     if (sessionActive && ((millis() - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000UL)))
     {
-      Serial.println(F("\nINACTIVITY_TIMEOUT_SECS - irrigation session ended"));
+      LOG("\nINACTIVITY_TIMEOUT_SECS - irrigation session ended\n");
       publishSessionReport();
       sessionActive = false;
     }
@@ -383,7 +398,7 @@ void loop()
       int polledValve = getActiveValve();
       if (polledValve != lastValvePollResult || (millis() - lastValvePollPrintMs) >= 5000)
       {
-        Serial.printf("[valve poll] active valve = %d\n", polledValve);
+        LOG("[valve poll] active valve = %d\n", polledValve);
         lastValvePollResult = polledValve;
         lastValvePollPrintMs = millis();
       }
@@ -427,7 +442,7 @@ void publishSessionReport()
   if (valveLastFlowPulse >= 0)
     zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
   mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
-  Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+  LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
   sendTotalsReport();
   resetSessionData();
   millisStart = millis();  // reset so inactivity timeout doesn't re-fire immediately
@@ -517,26 +532,26 @@ void setup_OTA()
     else
       type = "filesystem";  // U_FS
 
-    Serial.println("OTA Start updating " + type);
+    LOG("OTA Start updating %s\n", type.c_str());
   });
   ArduinoOTA.onEnd([]() {
-    Serial.println(F("\nOTA End"));
+    LOG("\nOTA End\n");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+    LOG("OTA Progress: %u%%\r", (progress / (total / 100)));
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("OTA Error[%u]: ", error);
+    LOG("OTA Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR)
-      Serial.println(F("OTA Auth Failed"));
+      LOG("OTA Auth Failed\n");
     else if (error == OTA_BEGIN_ERROR)
-      Serial.println(F("OTA Begin Failed"));
+      LOG("OTA Begin Failed\n");
     else if (error == OTA_CONNECT_ERROR)
-      Serial.println(F("OTA Connect Failed"));
+      LOG("OTA Connect Failed\n");
     else if (error == OTA_RECEIVE_ERROR)
-      Serial.println(F("OTA Receive Failed"));
+      LOG("OTA Receive Failed\n");
     else if (error == OTA_END_ERROR)
-      Serial.println(F("OTA End Failed"));
+      LOG("OTA End Failed\n");
   });
   ArduinoOTA.begin();
 }
@@ -559,20 +574,20 @@ void connectMQTT()
       mqttNow = millis();
       if (mqttNow - lastReconnectAttempt > 1000)
       {
-        Serial.printf("[%s] Waiting for MQTT...\n", myTZ.dateTime(RFC3339).c_str());
+        LOG("[%s] Waiting for MQTT...\n", myTZ.dateTime(RFC3339).c_str());
         lastReconnectAttempt = mqttNow;
         connectAttemptCount++;
         if (reconnect())
         {
           mqttClient.publish(IRRIG_LWT_TOPIC, "Connected", true);
-          Serial.printf("\n%s MQTT SENT: %s/Connected\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_LWT_TOPIC);
+          LOG("\n%s MQTT SENT: %s/Connected\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_LWT_TOPIC);
           lastReconnectAttempt = 0;
           return;
         }
       }
     }
   }
-  Serial.println("ERROR-----Max MQTT connect attempts exceeded");
+  LOG("ERROR-----Max MQTT connect attempts exceeded\n");
 }
 
 
@@ -583,7 +598,7 @@ void callback(char *topic, byte *payload, unsigned int length)
 {
   strncpy(mqttMsg, (char *)payload, length);
   mqttMsg[length] = (char)NULL;
-  Serial.printf("\n%s MQTT RECVD: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), topic, mqttMsg);
+  LOG("\n%s MQTT RECVD: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), topic, mqttMsg);
 }
 
 
@@ -596,8 +611,7 @@ boolean reconnect()
   {
     connectedOK = true;
     digitalWrite(BUILT_IN_LED_PIN, LOW);    // LED OFF immediately on successful connect
-    Serial.print(F("MQTT connected to "));
-    Serial.println(F(MQTT_SERVER));
+    LOG("MQTT connected to %s\n", MQTT_SERVER);
   }
   return mqttClient.connected();
 }
@@ -617,25 +631,25 @@ void sendTotalsReport()
     sprintf(mqttTopic, "%s_%d", IRRIG_GPM_TOPIC_PREFIX, i);
     sprintf(mqttMsg, "%.2f", zoneData[i].averageGPM);
     mqttClient.publish(mqttTopic, mqttMsg, true);
-    Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
     sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"preMeasureGallons\": \"%d\", \"measuredZoneGallons\": \"%d\", \"maxGPM\": \"%.2f\"}",
                      zoneData[i].valveNum, zoneData[i].preMeasureGallons, zoneData[i].measuredZoneGallons, zoneData[i].maxGPM);
     sprintf(mqttTopic, "%s_%d%s", IRRIG_GPM_TOPIC_PREFIX, i, "/attributes");
     mqttClient.publish(mqttTopic, mqttMsg, true);
-    Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
     // send PSI & temperature
     sprintf(mqttTopic, "%s_%d", IRRIG_PSI_TOPIC_PREFIX, i);
     sprintf(mqttMsg, "%.2f", zoneData[i].averagePSI);
     mqttClient.publish(mqttTopic, mqttMsg, true);
-    Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
     sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\", \"waterTemperature\": \"%.2f\"}",
                      zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI, zoneData[i].waterTemperature);
     sprintf(mqttTopic, "%s_%d%s", IRRIG_PSI_TOPIC_PREFIX, i, "/attributes");
     mqttClient.publish(mqttTopic, mqttMsg, true);
-    Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
     // send run duration (zones 1-4 only)
     if (i > 0)
@@ -643,7 +657,7 @@ void sendTotalsReport()
       sprintf(mqttTopic, "%s_%d", IRRIG_RUN_DURATION_TOPIC_PREFIX, i);
       sprintf(mqttMsg, "%.1f", zoneData[i].runDurationMs / 60000.0f);
       mqttClient.publish(mqttTopic, mqttMsg, true);
-      Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+      LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
     }
 
     galsAllZones = galsAllZones + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
@@ -654,17 +668,17 @@ void sendTotalsReport()
 
   sprintf(mqttMsg, "%d", galsAllZones);
   mqttClient.publish(IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg, true);
-  Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg);
+  LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg);
 
   if (valveOffLeakGals > 0)
   {
     sprintf(mqttMsg, "%d", valveOffLeakGals);
     mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg, true);
-    Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg);
+    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg);
   }
   else
     mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, "0", true);
-    Serial.printf("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, "0");
+    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, "0");
 }
 
 
@@ -681,10 +695,10 @@ void sendPressureSensorStatus()
     idleWaterTemperature = readPressureSensor(READ_TEMPERATURE);
     sprintf(mqttMsg, "%.2f", idleWaterPressure);
     mqttClient.publish(IRRIG_IDLE_PRESSURE_TOPIC, mqttMsg, true);
-    Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_PRESSURE_TOPIC, mqttMsg);
+    LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_PRESSURE_TOPIC, mqttMsg);
     sprintf(mqttMsg, "%.2f", idleWaterTemperature);
     mqttClient.publish(IRRIG_IDLE_WATER_TEMPERATURE_TOPIC, mqttMsg, true);
-    Serial.printf("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_WATER_TEMPERATURE_TOPIC, mqttMsg);
+    LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_WATER_TEMPERATURE_TOPIC, mqttMsg);
   }
 }
 
@@ -748,7 +762,7 @@ float readPressureSensor(int pressOrtemp)
           lastPressErrReportNow = millis();
           if ((unsigned long)(lastPressErrReportNow - lastPressErrReport) > (unsigned long)PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
           {
-            Serial.println(F("Error reading pressure sensor"));
+            LOG("Error reading pressure sensor\n");
             lastPressErrReport = millis();
           }
           while ((millis() - lastPressErrReportNow) < PRESSURE_READ_INTERVAL_MS)
