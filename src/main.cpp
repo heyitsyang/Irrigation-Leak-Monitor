@@ -64,7 +64,7 @@
 #define TOT_NUM_VALVES 4
 #define PRESSURE_SENSOR_INSTALLED 1
 #define PREFER_FAHRENHEIT 1
-#define FLOW_SETTLE_SECS 10                          // wait for empty pipe to fill and settle - normally set to 35
+#define FLOW_SETTLE_SECS 35                          // wait for empty pipe to fill and settle
 #define INACTIVITY_TIMEOUT_SECS 90                   // wait this long after last pulse before ending session - normally set to 90
 #define HEARTBEAT_SECS 3600                          // seconds between wellness check-in publishes - normally set to 3600
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
@@ -122,6 +122,7 @@ struct ZoneSummary zoneData[TOT_NUM_VALVES+1];           // array to keep flow d
 
 int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
 unsigned long lastReconnectAttempt = 0;
+unsigned long sensorStuckUntilMs = 0;
 unsigned long pressureLastRead = 0, lastPressErrReport = 0;
 unsigned long millisNow, millisStart = 0, millisPrev = 0, startSettling, millisElapsed;
 unsigned long zoneStartMs = 0;
@@ -300,7 +301,7 @@ void loop()
   }
 
   // Flow detection
-  if (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)   // pulse is active when LOW
+  if (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW && millis() >= sensorStuckUntilMs)   // pulse is active when LOW
   {
     if (!sessionActive)
     {
@@ -351,6 +352,7 @@ void loop()
       digitalWrite(BUILT_IN_LED_PIN, connectedOK ? HIGH : LOW);   // blink state
       while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)
       {
+        ArduinoOTA.handle();
         millisNow = millis();
         if (blinkActive && (millisNow - blinkStart) >= 500)
         {
@@ -361,6 +363,7 @@ void loop()
         {
           DEBUG_PRINTLN(F("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW"));
           digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);  // restore rest state
+          sensorStuckUntilMs = millis() + (INACTIVITY_TIMEOUT_SECS * 1000UL);
           publishSessionReport();
           sessionActive = false;
           return;
@@ -545,6 +548,7 @@ void connectMQTT()
   mqttClient.setCallback(callback);
   while (connectAttemptCount < MAX_MQTT_CONNECT_ATTTEMPTS)
   {
+    ArduinoOTA.handle();
     if (!mqttClient.connected())
     {
       mqttNow = millis();
@@ -640,7 +644,7 @@ void sendTotalsReport()
     galsAllZones = galsAllZones + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
 
     if (zoneData[i].valveNum == 0)  // valNum == 0 means no valves ON, so any flow must be a leak
-      valveOffLeakGals = valveOffLeakGals + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
+      valveOffLeakGals = valveOffLeakGals + zoneData[i].measuredZoneGallons;
   }
 
   sprintf(mqttMsg, "%d", galsAllZones);
