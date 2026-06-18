@@ -5,6 +5,7 @@
  ****************************/
 
 #include <Arduino.h>
+#include <atomic>
 #ifdef ESP32
   #include <WiFi.h>
   #include <WiFiMulti.h>
@@ -128,6 +129,7 @@ bool once;
 bool sessionActive = false;
 bool connectedOK = false;
 unsigned long lastHeartbeatMs = 0;
+std::atomic<bool> webSerialPromptRequested{false};
 
 
 void LOG(const char* fmt, ...)
@@ -168,6 +170,9 @@ void setup()
   millisStart = millis();
 
   setup_wifi();
+  WebSerial.onMessage([](uint8_t* data, size_t len) {
+    webSerialPromptRequested = true;
+  });
   WebSerial.begin(&server);
   server.begin();
   setup_OTA();
@@ -222,6 +227,15 @@ void setup()
  ***********************/
 void loop()
 {
+  if (webSerialPromptRequested) {
+    webSerialPromptRequested = false;
+    LOG("irrig-leak> %s | WiFi %s %ddBm | MQTT %s | zone %s\n",
+      myTZ.dateTime("[Y-m-d H:i:s]").c_str(),
+      WiFi.SSID().c_str(), WiFi.RSSI(),
+      mqttClient.connected() ? "OK" : "LOST",
+      sessionActive ? "ACTIVE" : "idle");
+  }
+
   ArduinoOTA.handle();
 
   // Reconnect WiFi/MQTT if dropped; LED driven at drop/connect events
