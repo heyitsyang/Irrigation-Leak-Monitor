@@ -57,6 +57,7 @@
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
 #define PRESSURE_READ_INTERVAL_MS 0                   // minimum ms between I2C reads (0 = read every call)
+#define PRESSURE_SENSOR_INVALID -99.0f               // sentinel returned when sensor is unavailable
 
 // MQTT
 #define MQTT_MSG_BUFFER_SIZE 512                            // for MQTT message payload
@@ -79,8 +80,8 @@
 
 #define IRRIG_RECV_COMMAND_TOPIC "irrig_leak/cmd/#"
 // MIS
-#define READ_TEMPERATURE 1
-#define READ_PRESSURE 1
+#define READ_TEMPERATURE 1  // pass to readPressureSensor() to return temperature
+#define READ_PRESSURE 0     // pass to readPressureSensor() to return pressure
 
 struct ZoneSummary
 {
@@ -116,6 +117,7 @@ unsigned long pressureReadNow, mqttNow, lastPressErrReportNow;
 byte sensorStatus;
 float psiTminus0 = 0;
 float avgPressure, maxPressure, minPressure, currentPressure, temperature, runningTotPressure = 0;
+unsigned int validPressureReadCount = 0;
 float instantGPM = 0, runningTotGPM = 0, avgGPM, maxGPM;
 unsigned int flowPulseCount = 0, flowPreMeasurePulseCount = 0;
 bool once;
@@ -293,10 +295,13 @@ void loop()
     }
 
     currentPressure = readPressureSensor(READ_PRESSURE);
-    if (maxPressure < currentPressure)
-      maxPressure = currentPressure;
-    if (minPressure > currentPressure)
-      minPressure = currentPressure;
+    if (currentPressure != PRESSURE_SENSOR_INVALID)
+    {
+      if (maxPressure == PRESSURE_SENSOR_INVALID || maxPressure < currentPressure)
+        maxPressure = currentPressure;
+      if (minPressure == PRESSURE_SENSOR_INVALID || minPressure > currentPressure)
+        minPressure = currentPressure;
+    }
     valveThisFlowPulse = getActiveValve();
 
     if (valveThisFlowPulse != valveLastFlowPulse)  // zone has changed
@@ -309,10 +314,19 @@ void loop()
       startSettling = millis();
       flowPulseCount = 1;
       flowPreMeasurePulseCount = 0;
-      avgPressure = currentPressure;
-      maxPressure = currentPressure;
-      minPressure = currentPressure;
-      runningTotPressure = currentPressure;
+      validPressureReadCount = 0;
+      avgPressure = PRESSURE_SENSOR_INVALID;
+      maxPressure = PRESSURE_SENSOR_INVALID;
+      minPressure = PRESSURE_SENSOR_INVALID;
+      runningTotPressure = 0;
+      if (currentPressure != PRESSURE_SENSOR_INVALID)
+      {
+        avgPressure = currentPressure;
+        maxPressure = currentPressure;
+        minPressure = currentPressure;
+        runningTotPressure = currentPressure;
+        validPressureReadCount = 1;
+      }
       instantGPM = 0;
       maxGPM = 0;
       avgGPM = 0;
@@ -321,8 +335,12 @@ void loop()
     else
     {
       flowPulseCount++;
-      runningTotPressure = runningTotPressure + currentPressure;
-      avgPressure = runningTotPressure / flowPulseCount;
+      if (currentPressure != PRESSURE_SENSOR_INVALID)
+      {
+        runningTotPressure += currentPressure;
+        validPressureReadCount++;
+        avgPressure = runningTotPressure / validPressureReadCount;
+      }
     }
 
     millisStart = millis();
@@ -363,7 +381,15 @@ void loop()
         flowPreMeasurePulseCount = flowPulseCount;
         flowPulseCount = 1;
         runningTotGPM = 0;
-        runningTotPressure = currentPressure;
+        validPressureReadCount = 0;
+        runningTotPressure = 0;
+        avgPressure = PRESSURE_SENSOR_INVALID;
+        if (currentPressure != PRESSURE_SENSOR_INVALID)
+        {
+          runningTotPressure = currentPressure;
+          validPressureReadCount = 1;
+          avgPressure = currentPressure;
+        }
         LOG("\nFLOW MEASUREMENT STARTED, %d gallons flowed during pre-measurement settling time\n", flowPreMeasurePulseCount);
       }
 
@@ -430,10 +456,11 @@ void resetSessionData()
   flowPreMeasurePulseCount = 0;
   millisElapsed = 0;
   millisPrev = 0;
-  avgPressure = 0;
-  maxPressure = 0;
-  minPressure = 0;
+  avgPressure = PRESSURE_SENSOR_INVALID;
+  maxPressure = PRESSURE_SENSOR_INVALID;
+  minPressure = PRESSURE_SENSOR_INVALID;
   runningTotPressure = 0;
+  validPressureReadCount = 0;
   avgGPM = 0;
   runningTotGPM = 0;
   instantGPM = 0;
@@ -612,17 +639,26 @@ void sendTotalsReport()
     mqttClient.publish(mqttTopic, mqttMsg, true);
     LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-    // send PSI & temperature
-    sprintf(mqttTopic, "%s_%d", IRRIG_PSI_TOPIC_PREFIX, i);
-    sprintf(mqttMsg, "%.2f", zoneData[i].averagePSI);
-    mqttClient.publish(mqttTopic, mqttMsg, true);
-    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+    // send PSI & temperature — skip entirely if sensor was unavailable this session
+    if (zoneData[i].averagePSI != PRESSURE_SENSOR_INVALID)
+    {
+      sprintf(mqttTopic, "%s_%d", IRRIG_PSI_TOPIC_PREFIX, i);
+      sprintf(mqttMsg, "%.2f", zoneData[i].averagePSI);
+      mqttClient.publish(mqttTopic, mqttMsg, true);
+      LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-    sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\", \"waterTemperature\": \"%.2f\"}",
-                     zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI, zoneData[i].waterTemperature);
-    sprintf(mqttTopic, "%s_%d%s", IRRIG_PSI_TOPIC_PREFIX, i, "/attributes");
-    mqttClient.publish(mqttTopic, mqttMsg, true);
-    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+      if (zoneData[i].waterTemperature != PRESSURE_SENSOR_INVALID)
+        sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\", \"waterTemperature\": \"%.2f\"}",
+                         zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI, zoneData[i].waterTemperature);
+      else
+        sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\"}",
+                         zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI);
+      sprintf(mqttTopic, "%s_%d%s", IRRIG_PSI_TOPIC_PREFIX, i, "/attributes");
+      mqttClient.publish(mqttTopic, mqttMsg, true);
+      LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
+    }
+    else
+      LOG("Skipping PSI/temp MQTT publish for zone %d — sensor unavailable\n", i);
 
     // send run duration (zones 1-4 only)
     if (i > 0)
@@ -738,6 +774,8 @@ float readPressureSensor(int pressOrtemp)
             LOG("Error reading pressure sensor\n");
             lastPressErrReport = millis();
           }
+          psiTminus0 = PRESSURE_SENSOR_INVALID;
+          temperature = PRESSURE_SENSOR_INVALID;
           while ((millis() - lastPressErrReportNow) < PRESSURE_READ_INTERVAL_MS)
             yield();
           break;
@@ -750,6 +788,8 @@ float readPressureSensor(int pressOrtemp)
 
   if (pressOrtemp == READ_TEMPERATURE)
   {
+    if (temperature == PRESSURE_SENSOR_INVALID)
+      return PRESSURE_SENSOR_INVALID;
     if (PREFER_FAHRENHEIT)
       return((temperature * 9 / 5) + 32);
     else
