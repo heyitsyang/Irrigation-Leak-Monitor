@@ -24,8 +24,6 @@
 #include "prototypes.h"
 #include "credentials.h"     // <<<<<<<  COMMENT THIS LINE OUT & ENTER YOUR CREDENTIALS BELOW - this contains stuff for my WIFI network, not yours
 
-#define DEBUG_VALVES 1     // comment line out to undefine - setting to 0 is still considered defined
-
 // name the device
 #define DEVICE_HOST_NAME "irrig-leak"
 
@@ -437,7 +435,6 @@ void loop()
     }
     yield();
 
-#ifdef DEBUG_VALVES
     {
       static int lastValvePollResult = getActiveValve();
       int polledValve = getActiveValve();
@@ -447,7 +444,6 @@ void loop()
         lastValvePollResult = polledValve;
       }
     }
-#endif
   }
 }
 
