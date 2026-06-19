@@ -131,6 +131,11 @@ bool connectedOK = false;
 unsigned long lastHeartbeatMs = 0;
 std::atomic<bool> webSerialPromptRequested{false};
 
+#define PRECONNECT_LOG_BUF_SIZE 2048
+static char preConnectLog[PRECONNECT_LOG_BUF_SIZE];
+static size_t preConnectLogLen = 0;
+static bool preConnectLogReplayed = false;
+
 
 void LOG(const char* fmt, ...)
 {
@@ -141,6 +146,15 @@ void LOG(const char* fmt, ...)
   va_end(args);
   Serial.print(buf);
   WebSerial.print(buf);
+  if (!preConnectLogReplayed) {
+    size_t len = strnlen(buf, sizeof(buf));
+    size_t space = PRECONNECT_LOG_BUF_SIZE - preConnectLogLen;
+    if (len > space) len = space;
+    if (len > 0) {
+      memcpy(preConnectLog + preConnectLogLen, buf, len);
+      preConnectLogLen += len;
+    }
+  }
 }
 
 
@@ -161,9 +175,6 @@ void setup()
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
-  Serial.printf("\n\n\nIrrigation Leak Detector %s\n", VERSION);
-  Serial.printf("Size of struct ZoneSummary = %d\n", sizeof(ZoneSummary));
-
   digitalWrite(BUILT_IN_LED_PIN, HIGH);       // LED on during init
 
   resetSessionData();
@@ -176,6 +187,8 @@ void setup()
   WebSerial.begin(&server);
   server.begin();
   setup_OTA();
+  LOG("\n\n\nIrrigation Leak Detector %s\n", VERSION);
+  LOG("Size of struct ZoneSummary = %d\n", sizeof(ZoneSummary));
   waitForSync();  // sync the time; ezTime will re-sync periodically on its own schedule
   myTZ.setLocation(F(MY_TIMEZONE));
   LOG("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
@@ -227,6 +240,25 @@ void setup()
  ***********************/
 void loop()
 {
+  WebSerial.loop();
+
+  {
+    static bool wsWasConnected = false;
+    bool wsNowConnected = WebSerial.getConnectionCount();
+    if (!wsWasConnected && wsNowConnected && preConnectLogLen > 0) {
+      const size_t chunkSize = 512;
+      size_t offset = 0;
+      while (offset < preConnectLogLen) {
+        size_t chunk = (preConnectLogLen - offset < chunkSize) ? (preConnectLogLen - offset) : chunkSize;
+        WebSerial.write((const uint8_t*)(preConnectLog + offset), chunk);
+        offset += chunk;
+      }
+      preConnectLogLen = 0;
+      preConnectLogReplayed = true;
+    }
+    wsWasConnected = wsNowConnected;
+  }
+
   if (webSerialPromptRequested) {
     webSerialPromptRequested = false;
     LOG("irrig-leak> %s | WiFi %s %ddBm | MQTT %s | zone %s\n",
@@ -407,14 +439,12 @@ void loop()
 
 #ifdef DEBUG_VALVES
     {
-      static unsigned long lastValvePollPrintMs = 0;
-      static int lastValvePollResult = -99;
+      static int lastValvePollResult = getActiveValve();
       int polledValve = getActiveValve();
-      if (polledValve != lastValvePollResult || (millis() - lastValvePollPrintMs) >= 5000)
+      if (polledValve != lastValvePollResult)
       {
         LOG("[valve poll] active valve = %d\n", polledValve);
         lastValvePollResult = polledValve;
-        lastValvePollPrintMs = millis();
       }
     }
 #endif
