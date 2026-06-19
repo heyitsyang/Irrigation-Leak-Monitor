@@ -29,7 +29,7 @@
 // TIME SETTINGS
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 
-#define VERSION "Ver 0.3 build 2026.06.1"
+#define VERSION "Ver 0.4 build 2026.06.0"
 
 // GPIO PIN DEFINITIONS
 #define BUILT_IN_LED_PIN 17
