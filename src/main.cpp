@@ -469,6 +469,8 @@ void setup_wifi()
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
   Serial.println(WiFi.macAddress());
 
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print(F("\nWaiting for WiFi "));
