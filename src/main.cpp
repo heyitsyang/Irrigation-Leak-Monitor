@@ -8,7 +8,6 @@
 #include <atomic>
 #ifdef ESP32
   #include <WiFi.h>
-  #include <WiFiMulti.h>
 #else
   #include <ESP8266WiFi.h>
 #endif
@@ -68,8 +67,6 @@
 #define IRRIG_VERSION_TOPIC "irrig_leak/version"            // report software version at connect
 #define IRRIG_WIFI_STRENGTH_TOPIC "irrig_leak/wifi_dbm"     // signal strength of the active WiFi network
 #define IRRIG_WIFI_SSID_TOPIC "irrig_leak/wifi_ssid"
-#define IRRIG_WIFI_PRIMARY_DBM_TOPIC   "irrig_leak/wifi_primary_dbm"    // for ShenCentral SSID
-#define IRRIG_WIFI_SECONDARY_DBM_TOPIC "irrig_leak/wifi_secondary_dbm"  // for irrig-leak SSID
 #define IRRIG_IDLE_TIME_STAMP_TOPIC "irrig_leak/idle/time_stamp"
 #define IRRIG_IDLE_PRESSURE_TOPIC "irrig_leak/idle/water_pressure"
 #define IRRIG_IDLE_WATER_TEMPERATURE_TOPIC "irrig_leak/idle/water_temperature"
@@ -102,7 +99,6 @@ struct ZoneSummary
 AsyncWebServer server(80);
 
 WiFiClient espClient;
-WiFiMulti wifiMulti;
 PubSubClient mqttClient(espClient);
 Timezone myTZ;
 
@@ -205,20 +201,6 @@ void setup()
   mqttClient.publish(IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str(), true);
   LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str());
 
-  {
-    CandidateRSSI candidates = scanAndLogWifi();
-    if (candidates.primary != INT8_MIN) {
-      sprintf(mqttMsg, "%d", candidates.primary);
-      mqttClient.publish(IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg, true);
-      LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg);
-    }
-    if (candidates.secondary != INT8_MIN) {
-      sprintf(mqttMsg, "%d", candidates.secondary);
-      mqttClient.publish(IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg, true);
-      LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg);
-    }
-  }
-
   // Initialize run duration topics to 0 so HA never shows Unknown on fresh boot
   for (int i = 1; i <= TOT_NUM_VALVES; i++)
   {
@@ -273,7 +255,7 @@ void loop()
   {
     LOG("WiFi lost, reconnecting...\n");
     if (connectedOK) { connectedOK = false; digitalWrite(BUILT_IN_LED_PIN, HIGH); }
-    wifiMulti.run();
+    WiFi.reconnect();
   }
   if (!mqttClient.connected())
   {
@@ -294,20 +276,6 @@ void loop()
 
     mqttClient.publish(IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str(), true);
     LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str());
-
-    {
-      CandidateRSSI candidates = scanAndLogWifi();
-      if (candidates.primary != INT8_MIN) {
-        sprintf(mqttMsg, "%d", candidates.primary);
-        mqttClient.publish(IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg, true);
-        LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_PRIMARY_DBM_TOPIC, mqttMsg);
-      }
-      if (candidates.secondary != INT8_MIN) {
-        sprintf(mqttMsg, "%d", candidates.secondary);
-        mqttClient.publish(IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg, true);
-        LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SECONDARY_DBM_TOPIC, mqttMsg);
-      }
-    }
 
     sendPressureSensorStatus();
   }
@@ -490,40 +458,6 @@ void publishSessionReport()
 
 
 /*
- * scanAndLogWifi - scan visible APs, log all to serial, return RSSI for each configured candidate
- */
-CandidateRSSI scanAndLogWifi()
-{
-  CandidateRSSI result = { INT8_MIN, INT8_MIN };
-
-  int n = WiFi.scanNetworks(false, true);
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == PRIMARY_WIFI_SSID && WiFi.RSSI(i) > result.primary)
-      result.primary = (int8_t)WiFi.RSSI(i);
-  }
-  WiFi.scanDelete();
-
-  // Hidden SSIDs return "" in broadcast scan; directed probe makes them respond with SSID populated
-  int m = WiFi.scanNetworks(false, true, false, 300, 0, SECONDARY_WIFI_SSID);
-  for (int i = 0; i < m; i++) {
-    if (WiFi.SSID(i) == SECONDARY_WIFI_SSID && WiFi.RSSI(i) > result.secondary)
-      result.secondary = (int8_t)WiFi.RSSI(i);
-  }
-  WiFi.scanDelete();
-
-  // Synchronous scan can temporarily disconnect; yield until reconnected (or 5s timeout)
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    unsigned long recoveryStart = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - recoveryStart) < 5000)
-      yield();
-  }
-
-  return result;
-}
-
-
-/*
  * setup_wifi
  */
 void setup_wifi()
@@ -535,13 +469,10 @@ void setup_wifi()
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
   Serial.println(WiFi.macAddress());
 
-  wifiMulti.addAP(PRIMARY_WIFI_SSID,   PRIMARY_WIFI_PASSWORD);
-  wifiMulti.addAP(SECONDARY_WIFI_SSID, SECONDARY_WIFI_PASSWORD);
-
-  scanAndLogWifi();   // serial-only; MQTT not yet connected
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print(F("\nWaiting for WiFi "));
-  while (wifiMulti.run() != WL_CONNECTED)
+  while (WiFi.status() != WL_CONNECTED)
   {
     Serial.print(F("."));
     pauseTick = millis();
