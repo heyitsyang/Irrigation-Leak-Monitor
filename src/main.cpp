@@ -79,7 +79,6 @@
 #define IRRIG_RUN_DURATION_TOPIC_PREFIX "irrig_leak/report/run_dur_zone"  // valve/zone number is appended to the end to create the complete topic
 
 #define IRRIG_RECV_COMMAND_TOPIC "irrig_leak/cmd/#"
-// MIS
 #define READ_TEMPERATURE 1  // pass to readPressureSensor() to return temperature
 #define READ_PRESSURE 0     // pass to readPressureSensor() to return pressure
 
@@ -280,6 +279,7 @@ void loop()
     LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
     sprintf(mqttMsg, "%d", WiFi.RSSI());
     mqttClient.publish(IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg, true);
+    LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_STRENGTH_TOPIC, mqttMsg);
 
     mqttClient.publish(IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str(), true);
     LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_WIFI_SSID_TOPIC, WiFi.SSID().c_str());
@@ -691,8 +691,10 @@ void sendTotalsReport()
     LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg);
   }
   else
+  {
     mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, "0", true);
     LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, "0");
+  }
 }
 
 
