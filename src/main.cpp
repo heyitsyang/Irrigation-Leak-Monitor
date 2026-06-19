@@ -53,7 +53,7 @@
 #define PREFER_FAHRENHEIT 1
 #define FLOW_SETTLE_SECS 35                          // wait for empty pipe to fill and settle
 #define INACTIVITY_TIMEOUT_SECS 90                   // wait this long after last pulse before ending session - normally set to 90
-#define HEARTBEAT_SECS 3600                          // seconds between wellness check-in publishes - normally set to 3600
+#define HEARTBEAT_SECS 1800                          // seconds between wellness check-in publishes
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
 #define PRESSURE_READ_INTERVAL_MS 0                   // minimum ms between I2C reads (0 = read every call)
