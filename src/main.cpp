@@ -211,6 +211,11 @@ void setup()
     LOG("%s MQTT SENT: %s/0\n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic);
   }
 
+  // Publish idle state immediately on boot so HA has current data without waiting for the first heartbeat
+  mqttClient.publish(IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
+  LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_IDLE_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
+  sendPressureSensorStatus();
+
   lastHeartbeatMs = millis();
   LOG("\nSetup complete. Entering main loop.\n");
   LOG("================================\n\n");
