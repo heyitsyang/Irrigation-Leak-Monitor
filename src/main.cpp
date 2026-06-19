@@ -472,13 +472,13 @@ void setup_wifi()
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print(F("\nWaiting for WiFi "));
+  pauseTick = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
+    if ((millis() - pauseTick) >= 90000)
+      ESP.restart();
     Serial.print(F("."));
-    pauseTick = millis();
-    while ((millis() - pauseTick) < 90000)   // wait 90s solid-ON then restart
-      yield();
-    ESP.restart();
+    delay(500);
   }
 
   Serial.println(F(""));
