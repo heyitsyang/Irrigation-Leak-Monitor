@@ -1,11 +1,10 @@
-
+ed
 
 # Irrigation Leak Monitor
 
 This is project monitors four irrigation zones for unusually high flow (GPM).
 - Interfaces with Home Assistant via MQTT
-- Battery operated
-- Battery recharged using solar panel and sprinkler valve power (while operating)
+- 24vAC operated
 
 Sensors:
 - Hunter HC-100-FLOW Flowmeter
