@@ -49,6 +49,8 @@
 
 // OPERATIONAL PARAMETERS & PREFERENCES
 #define FLOW_GALS_PER_PULSE  1
+#define FLOW_PULSE_DEBOUNCE_MS 50                    // blank sensor after each pulse to suppress reed switch bounce (max flow 34 GPM = 1 pulse per 1765ms)
+#define MIN_LEAK_GALS 2                              // minimum zone-0 gallons before issuing a leak notification
 #define TOT_NUM_VALVES 4
 #define PRESSURE_SENSOR_INSTALLED 1
 #define PREFER_FAHRENHEIT 1
@@ -378,6 +380,7 @@ void loop()
       }
       digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);    // restore rest state
     }
+    sensorStuckUntilMs = millis() + FLOW_PULSE_DEBOUNCE_MS;  // suppress reed switch bounce on rising edge
 
     if ((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))
     {
@@ -686,7 +689,7 @@ void sendTotalsReport()
   mqttClient.publish(IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg, true);
   LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg);
 
-  if (valveOffLeakGals > 0)
+  if (valveOffLeakGals >= MIN_LEAK_GALS)
   {
     sprintf(mqttMsg, "%d", valveOffLeakGals);
     mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg, true);
