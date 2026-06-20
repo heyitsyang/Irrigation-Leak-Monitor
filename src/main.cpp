@@ -171,12 +171,6 @@ void setup()
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_BUS_FREQ_HZ);
-  int probeBytes = Wire.requestFrom((uint8_t)PRESSURE_SENSOR_I2C_ADDR, (uint8_t)4);
-  while (Wire.available()) Wire.read();
-  if (probeBytes == 4)
-    LOG("Pressure sensor found at 0x%02X\n", PRESSURE_SENSOR_I2C_ADDR);
-  else
-    LOG("Pressure sensor NOT found at 0x%02X (got %d bytes)\n", PRESSURE_SENSOR_I2C_ADDR, probeBytes);
 
   digitalWrite(BUILT_IN_LED_PIN, HIGH);       // LED on during init
 
