@@ -29,7 +29,7 @@
 // TIME SETTINGS
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 
-#define VERSION "Ver 0.4 build 2026.06.0"
+#define VERSION "Ver 0.4 build 2026.06.1"
 
 // GPIO PIN DEFINITIONS
 #define BUILT_IN_LED_PIN 17
@@ -42,8 +42,9 @@
 #define FLOW_SENSOR_BLUE_PIN 9                       // Hunter HC100FLOW flow meter - ACTIVE LOW
 #define FLOW_SENSOR_RED_PIN 11
 
-#define I2C_SCL_PIN 13
-#define I2C_SDA_PIN 14
+#define I2C_SCL_PIN 1
+#define I2C_SDA_PIN 2
+#define I2C_BUS_FREQ_HZ 100000                       // 100kHz standard mode (M3200 supports up to 400kHz)
 #define PRESSURE_SENSOR_I2C_ADDR 0x28                // TE M3200 pressure sensor
 
 // OPERATIONAL PARAMETERS & PREFERENCES
@@ -169,6 +170,13 @@ void setup()
   pinMode(BUILT_IN_LED_PIN, OUTPUT);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_BUS_FREQ_HZ);
+  int probeBytes = Wire.requestFrom((uint8_t)PRESSURE_SENSOR_I2C_ADDR, (uint8_t)4);
+  while (Wire.available()) Wire.read();
+  if (probeBytes == 4)
+    LOG("Pressure sensor found at 0x%02X\n", PRESSURE_SENSOR_I2C_ADDR);
+  else
+    LOG("Pressure sensor NOT found at 0x%02X (got %d bytes)\n", PRESSURE_SENSOR_I2C_ADDR, probeBytes);
 
   digitalWrite(BUILT_IN_LED_PIN, HIGH);       // LED on during init
 
@@ -748,7 +756,8 @@ float readPressureSensor(int pressOrtemp)
     if ((unsigned long)(pressureReadNow - pressureLastRead) > PRESSURE_READ_INTERVAL_MS)
     {
       pressureLastRead = millis();
-      while (sensorStatus != 0) // continue reading until valid
+      int retries = 0;
+      while (sensorStatus != 0 && retries++ < 5) // retry up to 5x for stale status; sensor updates every ~2ms
       {
         Wire.requestFrom(PRESSURE_SENSOR_I2C_ADDR, 4);
         int n = Wire.available();
@@ -770,7 +779,7 @@ float readPressureSensor(int pressOrtemp)
 
           rawT >>= 5;
 
-          psiTminus0 = ((rawP - 1000.0) / (15000.0 - 1000.0)) * MAX_PRESSURE;
+          psiTminus0 = ((rawP - 1638.0) / (14746.0 - 1638.0)) * MAX_PRESSURE;
           temperature = ((rawT - 512.0) / (1075.0 - 512.0)) * 55.0;
         }
         else
@@ -778,7 +787,7 @@ float readPressureSensor(int pressOrtemp)
           lastPressErrReportNow = millis();
           if ((unsigned long)(lastPressErrReportNow - lastPressErrReport) > (unsigned long)PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
           {
-            LOG("Error reading pressure sensor\n");
+            LOG("Error reading pressure sensor: got %d bytes (expected 4)\n", n);
             lastPressErrReport = millis();
           }
           psiTminus0 = PRESSURE_SENSOR_INVALID;
