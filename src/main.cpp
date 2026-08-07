@@ -29,21 +29,22 @@
 // TIME SETTINGS
 #define MY_TIMEZONE "America/New_York"               // <<<<<<< use Olson format: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 
-#define VERSION "Ver 0.4 build 2026.06.1"
+#define VERSION "Ver 0.4 build 2026.08.1"
 
 // GPIO PIN DEFINITIONS
-#define BUILT_IN_LED_PIN 17
+#define BUILT_IN_LED_PIN 21
+#define STATUS_LED_PIN 7
 
-#define VALVE_1_PIN 15
-#define VALVE_2_PIN 16
-#define VALVE_3_PIN 8
-#define VALVE_4_PIN 18
+#define VALVE_1_PIN 4
+#define VALVE_2_PIN 3
+#define VALVE_3_PIN 2
+#define VALVE_4_PIN 1
 
-#define FLOW_SENSOR_BLUE_PIN 9                       // Hunter HC100FLOW flow meter - ACTIVE LOW
-#define FLOW_SENSOR_RED_PIN 11
+#define FLOW_SENSOR_BLUE_PIN 43                       // Hunter HC100FLOW flow meter - ACTIVE LOW
+#define FLOW_SENSOR_RED_PIN 44
 
-#define I2C_SCL_PIN 1
-#define I2C_SDA_PIN 2
+#define I2C_SCL_PIN 6
+#define I2C_SDA_PIN 5
 #define I2C_BUS_FREQ_HZ 100000                       // 100kHz standard mode (M3200 supports up to 400kHz)
 #define PRESSURE_SENSOR_I2C_ADDR 0x28                // TE M3200 pressure sensor
 
@@ -57,6 +58,7 @@
 #define FLOW_SETTLE_SECS 35                          // wait for empty pipe to fill and settle
 #define INACTIVITY_TIMEOUT_SECS 90                   // wait this long after last pulse before ending session - normally set to 90
 #define HEARTBEAT_SECS 1800                          // seconds between wellness check-in publishes
+#define WIFI_DIAGNOSTICS 0                           // set to 0 to drop the boot-time AP scan and status decoding
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
 #define PRESSURE_READ_INTERVAL_MS 0                   // minimum ms between I2C reads (0 = read every call)
@@ -135,27 +137,6 @@ static size_t preConnectLogLen = 0;
 static bool preConnectLogReplayed = false;
 
 
-void LOG(const char* fmt, ...)
-{
-  char buf[512];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-  Serial.print(buf);
-  WebSerial.print(buf);
-  if (!preConnectLogReplayed) {
-    size_t len = strnlen(buf, sizeof(buf));
-    size_t space = PRECONNECT_LOG_BUF_SIZE - preConnectLogLen;
-    if (len > space) len = space;
-    if (len > 0) {
-      memcpy(preConnectLog + preConnectLogLen, buf, len);
-      preConnectLogLen += len;
-    }
-  }
-}
-
-
 /**********************
  *      SETUP
  **********************/
@@ -170,11 +151,13 @@ void setup()
   pinMode(FLOW_SENSOR_BLUE_PIN, INPUT);       // flow inputs are
   pinMode(FLOW_SENSOR_RED_PIN, INPUT);        // active low w external pullup
   pinMode(BUILT_IN_LED_PIN, OUTPUT);
+  digitalWrite(BUILT_IN_LED_PIN, HIGH);       // onboard LED is active LOW - HIGH = off
+  pinMode(STATUS_LED_PIN, OUTPUT);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_BUS_FREQ_HZ);
 
-  digitalWrite(BUILT_IN_LED_PIN, HIGH);       // LED on during init
+  digitalWrite(STATUS_LED_PIN, HIGH);       // LED on during init
 
   resetSessionData();
   millisStart = millis();
@@ -193,7 +176,7 @@ void setup()
   LOG("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
   connectMQTT();
   connectedOK = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
-  digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);
+  digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);
 
   mqttClient.loop();  // keep connection alive after waitForSync() blocking call
   mqttClient.publish(IRRIG_VERSION_TOPIC, VERSION, true);
@@ -264,12 +247,12 @@ void loop()
   if (WiFi.status() != WL_CONNECTED)
   {
     LOG("WiFi lost, reconnecting...\n");
-    if (connectedOK) { connectedOK = false; digitalWrite(BUILT_IN_LED_PIN, HIGH); }
+    if (connectedOK) { connectedOK = false; digitalWrite(STATUS_LED_PIN, HIGH); }
     WiFi.reconnect();
   }
   if (!mqttClient.connected())
   {
-    if (connectedOK) { connectedOK = false; digitalWrite(BUILT_IN_LED_PIN, HIGH); }
+    if (connectedOK) { connectedOK = false; digitalWrite(STATUS_LED_PIN, HIGH); }
     connectMQTT();   // reconnect() inside sets connectedOK=true and LED LOW on success
   }
   mqttClient.loop();
@@ -315,7 +298,10 @@ void loop()
 
     if (valveThisFlowPulse != valveLastFlowPulse)  // zone has changed
     {
-      LOG("\nZone %d detected (was %d)\n", valveThisFlowPulse, valveLastFlowPulse);
+      LOG("\nZone %d detected (was %d) [pins: 1=%d 2=%d 3=%d 4=%d]\n",
+          valveThisFlowPulse, valveLastFlowPulse,
+          digitalRead(VALVE_1_PIN), digitalRead(VALVE_2_PIN),
+          digitalRead(VALVE_3_PIN), digitalRead(VALVE_4_PIN));
       if (valveLastFlowPulse >= 0)
         zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
       zoneStartMs = millis();
@@ -357,7 +343,7 @@ void loop()
     {
       unsigned long blinkStart = millis();
       bool blinkActive = true;
-      digitalWrite(BUILT_IN_LED_PIN, connectedOK ? HIGH : LOW);   // blink state
+      digitalWrite(STATUS_LED_PIN, connectedOK ? HIGH : LOW);   // blink state
       while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)
       {
         ArduinoOTA.handle();
@@ -365,12 +351,12 @@ void loop()
         if (blinkActive && (millisNow - blinkStart) >= 500)
         {
           blinkActive = false;
-          digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);  // return to rest
+          digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);  // return to rest
         }
         if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
         {
           LOG("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW\n");
-          digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);  // restore rest state
+          digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);  // restore rest state
           sensorStuckUntilMs = millis() + (INACTIVITY_TIMEOUT_SECS * 1000UL);
           publishSessionReport();
           sessionActive = false;
@@ -378,7 +364,7 @@ void loop()
         }
         yield();
       }
-      digitalWrite(BUILT_IN_LED_PIN, connectedOK ? LOW : HIGH);    // restore rest state
+      digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);    // restore rest state
     }
     sensorStuckUntilMs = millis() + FLOW_PULSE_DEBOUNCE_MS;  // suppress reed switch bounce on rising edge
 
@@ -405,7 +391,7 @@ void loop()
 
       if (millisPrev > 0)
       {
-        instantGPM = (60 * 1000) / millisElapsed;
+        instantGPM = 60000.0f / (float)millisElapsed;
         if (instantGPM > maxGPM)
           maxGPM = instantGPM;
         runningTotGPM = runningTotGPM + instantGPM;
@@ -457,6 +443,31 @@ void loop()
  *********************************/
 
 /*
+ * LOG - printf-style logging mirrored to Serial and WebSerial; also captures output
+ *       into preConnectLog until a WebSerial client attaches and it gets replayed
+ */
+void LOG(const char* fmt, ...)
+{
+  char buf[512];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  WebSerial.print(buf);
+  if (!preConnectLogReplayed) {
+    size_t len = strnlen(buf, sizeof(buf));
+    size_t space = PRECONNECT_LOG_BUF_SIZE - preConnectLogLen;
+    if (len > space) len = space;
+    if (len > 0) {
+      memcpy(preConnectLog + preConnectLogLen, buf, len);
+      preConnectLogLen += len;
+    }
+  }
+}
+
+
+/*
  * resetSessionData - clears per-irrigation-session accumulators
  */
 void resetSessionData()
@@ -495,28 +506,120 @@ void publishSessionReport()
 
 
 /*
+ * onWiFiEvent - the driver's disconnect reason code is far more specific than
+ *               WiFi.status(); it names the exact stage that failed.
+ *               Reason codes: 201=NO_AP_FOUND, 15=4WAY_HANDSHAKE_TIMEOUT (bad password),
+ *               2=AUTH_EXPIRE, 3/8=ASSOC/STA_LEAVING, 205=CONNECTION_FAIL
+ */
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  switch (event)
+  {
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      LOG("\n  WiFi disconnected, reason=%d\n", info.wifi_sta_disconnected.reason);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      LOG("\n  associated with AP, awaiting IP\n");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      LOG("\n  got IP\n");
+      break;
+    default:
+      LOG("\n  wifi event %d\n", (int)event);   // catch-all: silence here hides the real failure
+      break;
+  }
+}
+
+
+/*
+ * wifiStatusName - decode WiFi.status() into something readable in the log
+ */
+const char* wifiStatusName(int status)
+{
+  switch (status)
+  {
+    case WL_IDLE_STATUS:     return "IDLE";
+    case WL_NO_SSID_AVAIL:   return "NO_SSID_AVAIL (AP not seen - antenna or range)";
+    case WL_SCAN_COMPLETED:  return "SCAN_COMPLETED";
+    case WL_CONNECTED:       return "CONNECTED";
+    case WL_CONNECT_FAILED:  return "CONNECT_FAILED (usually a bad password)";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED:    return "DISCONNECTED";
+    default:                 return "UNKNOWN";
+  }
+}
+
+
+/*
+ * scanForNetworks - list visible APs so we can tell a deaf radio from a refused login.
+ *                   Diagnostic only; gate off with WIFI_DIAGNOSTICS once WiFi is stable.
+ */
+void scanForNetworks()
+{
+  LOG("Scanning for networks...\n");
+  int found = WiFi.scanNetworks();
+  if (found <= 0)
+  {
+    LOG("  no APs found - check that the external U.FL antenna is attached\n");
+    return;
+  }
+
+  bool targetSeen = false;
+  for (int i = 0; i < found; i++)
+  {
+    bool isTarget = (WiFi.SSID(i) == WIFI_SSID);
+    if (isTarget) targetSeen = true;
+    LOG("  %2d) %-32s %4d dBm  ch%-3d %s\n", i + 1, WiFi.SSID(i).c_str(),
+        WiFi.RSSI(i), WiFi.channel(i), isTarget ? "<== target" : "");
+  }
+  if (!targetSeen)
+    LOG("  '%s' NOT among the %d visible APs\n", WIFI_SSID, found);
+  WiFi.scanDelete();
+}
+
+
+/*
  * setup_wifi
  */
 void setup_wifi()
 {
   unsigned long pauseTick;
 
+#if WIFI_DIAGNOSTICS
+  WiFi.onEvent(onWiFiEvent);            // register before mode() so STA_START is not missed
+#endif
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);               // don't let NVS-cached credentials shadow the ones below
+  WiFi.disconnect(true, true);          // clear any stale config left in flash by factory firmware (do not delete this line)
+  delay(100);
   WiFi.setHostname(DEVICE_HOST_NAME);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // set to maximum possible (draws 150mA)
-  Serial.println(WiFi.macAddress());
+  LOG("MAC address: %s\n", WiFi.macAddress().c_str());
+
+#if WIFI_DIAGNOSTICS
+  scanForNetworks();
+#endif
 
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wl_status_t beginResult = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  LOG("WiFi.begin(\"%s\") returned %s\n", WIFI_SSID, wifiStatusName(beginResult));
 
   Serial.print(F("\nWaiting for WiFi "));
   pauseTick = millis();
+  unsigned long lastStatusTick = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
     if ((millis() - pauseTick) >= 90000)
       ESP.restart();
     Serial.print(F("."));
+#if WIFI_DIAGNOSTICS
+    if ((millis() - lastStatusTick) >= 5000)     // periodic so the dots stay readable
+    {
+      lastStatusTick = millis();
+      LOG("\n  status=%s\n", wifiStatusName(WiFi.status()));
+    }
+#endif
     delay(500);
   }
 
@@ -620,7 +723,7 @@ boolean reconnect()
   if (mqttClient.connect(DEVICE_HOST_NAME, MQTT_USER_NAME, MQTT_PASSWORD, IRRIG_LWT_TOPIC, 2, true, "Disconnected"))
   {
     connectedOK = true;
-    digitalWrite(BUILT_IN_LED_PIN, LOW);    // LED OFF immediately on successful connect
+    digitalWrite(STATUS_LED_PIN, LOW);    // LED OFF immediately on successful connect
     LOG("MQTT connected to %s\n", MQTT_SERVER);
   }
   return mqttClient.connected();
@@ -634,6 +737,13 @@ void sendTotalsReport()
 {
   int i;
   unsigned int valveOffLeakGals = 0, galsAllZones = 0;
+
+  // If any active zone (1-4) ran this session, zone-0 flow is residual pressure bleed after
+  // valve shutoff — not a leak. Only flag zone-0 as a leak for sessions where NO active zone
+  // ran (i.e., flow started with all valves off from the beginning).
+  unsigned int sessionActiveZoneGals = 0;
+  for (i = 1; i <= TOT_NUM_VALVES; i++)
+    sessionActiveZoneGals += zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
 
   for (i = 0; i < (TOT_NUM_VALVES + 1); i++)
   {
@@ -681,7 +791,7 @@ void sendTotalsReport()
 
     galsAllZones = galsAllZones + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
 
-    if (zoneData[i].valveNum == 0)  // valNum == 0 means no valves ON, so any flow must be a leak
+    if (zoneData[i].valveNum == 0 && sessionActiveZoneGals == 0)  // zone-0 only counts as leak when no active zones ran this session
       valveOffLeakGals = valveOffLeakGals + zoneData[i].measuredZoneGallons;
   }
 

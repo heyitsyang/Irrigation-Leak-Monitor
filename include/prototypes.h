@@ -1,6 +1,11 @@
 /*
  *  prototypes.h
  */
+void LOG(const char* fmt, ...);
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+const char* wifiStatusName(int status);
+void scanForNetworks();
 void setup_wifi();
 void setup_OTA();
 void callback(char *topic, byte *payload, unsigned int length);
