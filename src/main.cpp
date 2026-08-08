@@ -66,6 +66,9 @@
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
 #define PRESSURE_READ_INTERVAL_MS 0                   // minimum ms between I2C reads (0 = read every call)
 #define PRESSURE_SENSOR_INVALID -99.0f               // sentinel returned when sensor is unavailable
+#define M3200_STATUS_NORMAL 0                        // top 2 bits of the pressure word: valid data
+#define M3200_STATUS_STALE 2                         // no new conversion since last read - benign, retry
+#define M3200_STATUS_FAULT 3                         // diagnostic fault - will not clear by re-reading
 
 // MQTT
 #define MQTT_MSG_BUFFER_SIZE 512                            // for MQTT message payload
@@ -243,11 +246,17 @@ void loop()
 
   if (webSerialPromptRequested) {
     webSerialPromptRequested = false;
-    LOG("irrig-leak> %s | WiFi %s %ddBm | MQTT %s | zone %s\n",
+    // Pressure/temperature are read live here so the sensor can be polled on demand with no
+    // flow at all - the per-pulse log only fires when the reed switch trips, which is no use
+    // for a static bench reading such as a zero-pressure check.
+    float promptPSI = readPressureSensor(READ_PRESSURE);
+    float promptTemp = readPressureSensor(READ_TEMPERATURE);
+    LOG("irrig-leak> %s | WiFi %s %ddBm | MQTT %s | zone %s | %.2f PSI | %.2f%c\n",
       myTZ.dateTime("[Y-m-d H:i:s]").c_str(),
       WiFi.SSID().c_str(), WiFi.RSSI(),
       mqttClient.connected() ? "OK" : "LOST",
-      sessionActive ? "ACTIVE" : "idle");
+      sessionActive ? "ACTIVE" : "idle",
+      promptPSI, promptTemp, PREFER_FAHRENHEIT ? 'F' : 'C');
   }
 
   ArduinoOTA.handle();
@@ -413,8 +422,9 @@ void loop()
     // physical quantity (unlike gallons, PSI is intensive - averageable, not addable).
     LOG("flow:  zone = %d  gallons = %d  millisElapsed = %lu  instantGPM = %.2f  medianGPM = %.2f  maxGPM = %.2f\n",
                  valveThisFlowPulse, flowPulseCount, millisElapsed, instantGPM, zoneMedianGPM, maxGPM);
-    LOG("press: currentPressure = %.2f  avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f\n",
-                 currentPressure, avgPressure, maxPressure, minPressure);
+    LOG("press: currentPressure = %.2f  avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  temperature = %.2f%c\n",
+                 currentPressure, avgPressure, maxPressure, minPressure,
+                 zoneData[valveThisFlowPulse].waterTemperature, PREFER_FAHRENHEIT ? 'F' : 'C');
 
     // A stuck-open valve passes full zone flow continuously, so the session never times out
     // and the end-of-session report never fires. Alert as soon as the volume says "leak".
@@ -980,7 +990,6 @@ float readPressureSensor(int pressOrtemp)
         int n = Wire.available();
         if (n == 4)
         {
-          sensorStatus = 0;
           uint16_t rawP;
           uint16_t rawT;
 
@@ -996,8 +1005,26 @@ float readPressureSensor(int pressOrtemp)
 
           rawT >>= 5;
 
-          psiTminus0 = ((rawP - 1638.0) / (14746.0 - 1638.0)) * MAX_PRESSURE;
-          temperature = ((rawT - 512.0) / (1075.0 - 512.0)) * 55.0;
+          // Only convert data the sensor says is good. Previously the conversion ran on every
+          // pass regardless of status, so a stale or faulted reading was returned looking
+          // exactly like a valid one.
+          if (sensorStatus == M3200_STATUS_NORMAL)
+          {
+            psiTminus0 = ((rawP - 1638.0) / (14746.0 - 1638.0)) * MAX_PRESSURE;
+            temperature = ((rawT - 512.0) / (1075.0 - 512.0)) * 55.0;
+          }
+          else if (sensorStatus == M3200_STATUS_FAULT)
+          {
+            lastPressErrReportNow = millis();
+            if ((unsigned long)(lastPressErrReportNow - lastPressErrReport) > (unsigned long)PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
+            {
+              LOG("Pressure sensor reports diagnostic fault (status %d)\n", sensorStatus);
+              lastPressErrReport = millis();
+            }
+            break;                    // a fault does not clear by re-reading
+          }
+          // M3200_STATUS_STALE means we read faster than the ~2ms conversion cycle - benign,
+          // so fall through and retry rather than treating it as a failure.
         }
         else
         {
@@ -1013,6 +1040,17 @@ float readPressureSensor(int pressOrtemp)
             yield();
           break;
         }
+      }
+
+      // Left the loop without the sensor ever reporting good data - retries exhausted on
+      // persistent stale, or a fault. Return the sentinel so the callers' existing
+      // skip-publish handling applies; otherwise a bad reading reaches Home Assistant
+      // looking indistinguishable from a real one. These are globals, so without this a
+      // previous call's value would also leak through.
+      if (sensorStatus != M3200_STATUS_NORMAL)
+      {
+        psiTminus0 = PRESSURE_SENSOR_INVALID;
+        temperature = PRESSURE_SENSOR_INVALID;
       }
     }
   }
