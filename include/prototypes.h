@@ -15,6 +15,10 @@ void resetSessionData();
 void publishSessionReport();
 
 int getActiveValve();
+void resetGPMHistogram();
+void addGPMSample(float gpm);
+float medianGPM();
+void publishLeakTopic(bool isLeak, const char* context);
 void sendTotalsReport();
 void sendPressureSensorStatus();
 float readPressureSensor(int pressOrtemp);

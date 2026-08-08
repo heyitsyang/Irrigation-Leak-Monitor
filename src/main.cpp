@@ -32,8 +32,8 @@
 #define VERSION "Ver 0.4 build 2026.08.1"
 
 // GPIO PIN DEFINITIONS
-#define BUILT_IN_LED_PIN 21
-#define STATUS_LED_PIN 7
+#define BUILT_IN_LED_PIN 21                         // yellow
+#define STATUS_LED_PIN 7                            // blue
 
 #define VALVE_1_PIN 4
 #define VALVE_2_PIN 3
@@ -55,8 +55,10 @@
 #define TOT_NUM_VALVES 4
 #define PRESSURE_SENSOR_INSTALLED 1
 #define PREFER_FAHRENHEIT 1
-#define FLOW_SETTLE_SECS 35                          // wait for empty pipe to fill and settle
 #define INACTIVITY_TIMEOUT_SECS 90                   // wait this long after last pulse before ending session - normally set to 90
+#define GPM_HIST_BIN_WIDTH 0.25f                     // GPM histogram resolution
+#define GPM_HIST_BINS 600                            // 0.25 GPM bins across 0-150 GPM; median is taken over the whole run
+                                                     // range must exceed any real reading - samples above it clamp into the top bin and skew the median
 #define HEARTBEAT_SECS 1800                          // seconds between wellness check-in publishes
 #define VALVE_AC_SAMPLE_MS 25                        // valve sense window - must exceed one mains cycle (16.7ms @ 60Hz) to bridge 24VAC zero crossings
 #define WIFI_DIAGNOSTICS 0                           // set to 0 to drop the boot-time AP scan and status decoding
@@ -80,7 +82,7 @@
 #define IRRIG_REPORT_TIME_STAMP_TOPIC "irrig_leak/report/time_stamp"
 #define IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC "irrig_leak/report/tot_gals_all_zones"
 #define IRRIG_VALVES_OFF_LEAK_TOPIC "irrig_leak/report/valve_leak"  // flow sensed when all valves are off & there should be none
-#define IRRIG_GPM_TOPIC_PREFIX "irrig_leak/report/avg_gpm_zone"  // valve/zone number is appended to the end to create the complete topic
+#define IRRIG_GPM_TOPIC_PREFIX "irrig_leak/report/median_gpm_zone"  // valve/zone number is appended to the end to create the complete topic
 #define IRRIG_PSI_TOPIC_PREFIX "irrig_leak/report/avg_psi_zone"  // valve/zone number is appended to the end to create the complete topic
 #define IRRIG_RUN_DURATION_TOPIC_PREFIX "irrig_leak/report/run_dur_zone"  // valve/zone number is appended to the end to create the complete topic
 
@@ -91,9 +93,8 @@
 struct ZoneSummary
 {
   u_int valveNum;
-  u_int preMeasureGallons;
   u_int measuredZoneGallons;
-  float averageGPM;
+  float medianGPM;
   float maxGPM;
   float averagePSI;
   float maxPSI;
@@ -116,16 +117,23 @@ int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
 unsigned long lastReconnectAttempt = 0;
 unsigned long sensorStuckUntilMs = 0;
 unsigned long pressureLastRead = 0, lastPressErrReport = 0;
-unsigned long millisNow, millisStart = 0, millisPrev = 0, startSettling, millisElapsed;
+unsigned long millisNow, millisStart = 0, millisPrev = 0, millisElapsed;
 unsigned long zoneStartMs = 0;
 unsigned long pressureReadNow, mqttNow, lastPressErrReportNow;
 byte sensorStatus;
 float psiTminus0 = 0;
 float avgPressure, maxPressure, minPressure, currentPressure, temperature, runningTotPressure = 0;
 unsigned int validPressureReadCount = 0;
-float instantGPM = 0, runningTotGPM = 0, avgGPM, maxGPM;
-unsigned int flowPulseCount = 0, flowPreMeasurePulseCount = 0;
-bool once;
+float instantGPM = 0, zoneMedianGPM, maxGPM;
+unsigned int flowPulseCount = 0;
+
+// GPM histogram for the current zone. A median over the whole run needs unbounded storage
+// if kept as samples, so bin instead: fixed 400 bytes, and unlike a ring buffer of recent
+// pulses it does not quietly redefine "average GPM" as "recent GPM".
+uint16_t gpmHistogram[GPM_HIST_BINS];
+unsigned int gpmSampleCount = 0;
+
+bool leakAlertSent = false;           // interim alert fires once per session
 
 bool sessionActive = false;
 bool connectedOK = false;
@@ -283,7 +291,6 @@ void loop()
       sessionActive = true;
       resetSessionData();
       zoneStartMs = millis();
-      startSettling = millis();
       LOG("\n--- Irrigation session started ---\n");
     }
 
@@ -304,12 +311,18 @@ void loop()
           digitalRead(VALVE_1_PIN), digitalRead(VALVE_2_PIN),
           digitalRead(VALVE_3_PIN), digitalRead(VALVE_4_PIN));
       if (valveLastFlowPulse >= 0)
+      {
         zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
+        zoneData[valveLastFlowPulse].medianGPM = medianGPM();   // flush outgoing zone's rate
+      }
       zoneStartMs = millis();
-      once = true;
-      startSettling = millis();
       flowPulseCount = 1;
-      flowPreMeasurePulseCount = 0;
+      resetGPMHistogram();
+      // The interval into this pulse spans the valve changeover, not flow through the new
+      // zone - it produced 4 GPM from a 14s gap and 94 GPM from a 637ms one. Clearing
+      // millisPrev makes this pulse contribute gallons but no rate sample, exactly as the
+      // first pulse of a session already does.
+      millisPrev = 0;
       validPressureReadCount = 0;
       avgPressure = PRESSURE_SENSOR_INVALID;
       maxPressure = PRESSURE_SENSOR_INVALID;
@@ -325,8 +338,7 @@ void loop()
       }
       instantGPM = 0;
       maxGPM = 0;
-      avgGPM = 0;
-      runningTotGPM = 0;
+      zoneMedianGPM = 0;
     }
     else
     {
@@ -369,48 +381,48 @@ void loop()
     }
     sensorStuckUntilMs = millis() + FLOW_PULSE_DEBOUNCE_MS;  // suppress reed switch bounce on rising edge
 
-    if ((millis() - startSettling) > (FLOW_SETTLE_SECS * 1000))
+    millisElapsed = (millisPrev > 0) ? (millisStart - millisPrev) : 0;
+
+    // Gallons are recorded on EVERY pulse, unconditionally. Previously this lived inside a
+    // settle-window gate, so a run shorter than the window recorded nothing at all.
+    // Accumulate rather than assign flowPulseCount: if a zone is ever revisited within a
+    // session, assigning would reset its total back to 1 and lose everything before it.
+    zoneData[valveThisFlowPulse].measuredZoneGallons += FLOW_GALS_PER_PULSE;
+    zoneData[valveThisFlowPulse].averagePSI = avgPressure;
+    zoneData[valveThisFlowPulse].maxPSI = maxPressure;
+    zoneData[valveThisFlowPulse].minPSI = minPressure;
+    zoneData[valveThisFlowPulse].waterTemperature = readPressureSensor(READ_TEMPERATURE);
+
+    // Rate is a separate concern from volume. The first pulse of a zone has no preceding
+    // interval, so it contributes gallons but no rate sample.
+    if (millisPrev > 0 && millisElapsed > 0)
     {
-      millisElapsed = (millisStart - millisPrev);
-      if (once)
-      {
-        once = false;
-        flowPreMeasurePulseCount = flowPulseCount;
-        flowPulseCount = 1;
-        runningTotGPM = 0;
-        validPressureReadCount = 0;
-        runningTotPressure = 0;
-        avgPressure = PRESSURE_SENSOR_INVALID;
-        if (currentPressure != PRESSURE_SENSOR_INVALID)
-        {
-          runningTotPressure = currentPressure;
-          validPressureReadCount = 1;
-          avgPressure = currentPressure;
-        }
-        LOG("\nFLOW MEASUREMENT STARTED, %d gallons flowed during pre-measurement settling time\n", flowPreMeasurePulseCount);
-      }
+      instantGPM = 60000.0f / (float)millisElapsed;
+      if (instantGPM > maxGPM)
+        maxGPM = instantGPM;
+      addGPMSample(instantGPM);
+      zoneMedianGPM = medianGPM();                 // median ignores the pipe-fill spike without a window
+      zoneData[valveThisFlowPulse].medianGPM = zoneMedianGPM;
+      zoneData[valveThisFlowPulse].maxGPM = maxGPM;
+    }
 
-      if (millisPrev > 0)
-      {
-        instantGPM = 60000.0f / (float)millisElapsed;
-        if (instantGPM > maxGPM)
-          maxGPM = instantGPM;
-        runningTotGPM = runningTotGPM + instantGPM;
-        avgGPM = runningTotGPM / flowPulseCount;
-        zoneData[valveThisFlowPulse].averageGPM = avgGPM;
-        zoneData[valveThisFlowPulse].maxGPM = maxGPM;
-        zoneData[valveThisFlowPulse].valveNum = valveThisFlowPulse;
-        zoneData[valveThisFlowPulse].measuredZoneGallons = flowPulseCount;
-        zoneData[valveThisFlowPulse].preMeasureGallons = flowPreMeasurePulseCount * FLOW_GALS_PER_PULSE;
-        zoneData[valveThisFlowPulse].averagePSI = avgPressure;
-        zoneData[valveThisFlowPulse].maxPSI = maxPressure;
-        zoneData[valveThisFlowPulse].minPSI = minPressure;
-        zoneData[valveThisFlowPulse].waterTemperature = readPressureSensor(READ_TEMPERATURE);
-      }
 
-      LOG("valveThisFlowPulse = %d  flowPulseCount = %d, currentPressure =  %.2f avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  runningTotPressure = %.2f\n",
-                   valveThisFlowPulse, flowPulseCount, currentPressure, avgPressure, maxPressure, minPressure, runningTotPressure);
-      LOG("                  millisElapsed = %lu instantGPM = %.2f  avgGPM = %.2f  runningTotGPM = %.2f \n", millisElapsed, instantGPM, avgGPM, runningTotGPM);
+    // Flow and pressure are unrelated measurements - the reed switch counts gallons, the
+    // M3200 reads PSI - so they get a line each. runningTotPressure is deliberately not
+    // logged: it is only the numerator of avgPressure, and a SUM of pressures is not a
+    // physical quantity (unlike gallons, PSI is intensive - averageable, not addable).
+    LOG("flow:  zone = %d  gallons = %d  millisElapsed = %lu  instantGPM = %.2f  medianGPM = %.2f  maxGPM = %.2f\n",
+                 valveThisFlowPulse, flowPulseCount, millisElapsed, instantGPM, zoneMedianGPM, maxGPM);
+    LOG("press: currentPressure = %.2f  avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f\n",
+                 currentPressure, avgPressure, maxPressure, minPressure);
+
+    // A stuck-open valve passes full zone flow continuously, so the session never times out
+    // and the end-of-session report never fires. Alert as soon as the volume says "leak".
+    if (zoneData[0].measuredZoneGallons > MIN_LEAK_GALS && !leakAlertSent)
+    {
+      leakAlertSent = true;
+      zoneData[0].medianGPM = medianGPM();     // flush the in-progress rate before reporting
+      publishLeakTopic(true, "LEAK ALERT (mid-session) ");
     }
 
     millisPrev = millisStart;
@@ -475,7 +487,6 @@ void resetSessionData()
 {
   memset(zoneData, 0, sizeof(zoneData));
   flowPulseCount = 0;
-  flowPreMeasurePulseCount = 0;
   millisElapsed = 0;
   millisPrev = 0;
   avgPressure = PRESSURE_SENSOR_INVALID;
@@ -483,11 +494,91 @@ void resetSessionData()
   minPressure = PRESSURE_SENSOR_INVALID;
   runningTotPressure = 0;
   validPressureReadCount = 0;
-  avgGPM = 0;
-  runningTotGPM = 0;
+  zoneMedianGPM = 0;
   instantGPM = 0;
+  maxGPM = 0;
   valveLastFlowPulse = -1;
-  once = false;
+  resetGPMHistogram();
+  leakAlertSent = false;
+}
+
+
+/*
+ * resetGPMHistogram / addGPMSample / medianGPM
+ *
+ * The zone average is a median rather than a mean so the pipe-fill spike at the start of a
+ * run is stepped over as a handful of outliers, with no settle window to tune and no
+ * sensitivity to flow rate. It also shrugs off a dropped reed pulse, which doubles an
+ * interval and halves that one sample - a mean would absorb that error.
+ *
+ * Binning instead of storing samples keeps the median over the WHOLE run at fixed cost; a
+ * ring buffer of recent pulses would quietly turn "average GPM" into "recent GPM".
+ */
+void resetGPMHistogram()
+{
+  memset(gpmHistogram, 0, sizeof(gpmHistogram));
+  gpmSampleCount = 0;
+}
+
+
+void addGPMSample(float gpm)
+{
+  int bin = (int)(gpm / GPM_HIST_BIN_WIDTH);
+  if (bin < 0)
+    bin = 0;
+  if (bin >= GPM_HIST_BINS)
+    bin = GPM_HIST_BINS - 1;          // clamp: anything above range lands in the top bin
+  if (gpmHistogram[bin] < 0xFFFF)
+    gpmHistogram[bin]++;
+  gpmSampleCount++;
+}
+
+
+float medianGPM()
+{
+  if (gpmSampleCount == 0)
+    return(0);
+
+  unsigned int half = gpmSampleCount / 2;
+  unsigned int running = 0;
+  for (int bin = 0; bin < GPM_HIST_BINS; bin++)
+  {
+    running += gpmHistogram[bin];
+    if (running > half)
+      return((bin + 0.5f) * GPM_HIST_BIN_WIDTH);   // bin centre
+  }
+  return(0);
+}
+
+
+/*
+ * publishLeakTopic - the single source of truth for valves-off flow.
+ *
+ * Zone 0 is not a zone, it is a fault condition, so it is reported here rather than as a
+ * fifth member of the per-zone series. State carries GALLONS: volume is monotonic within a
+ * session, is what the loss actually costs, and unlike a rate it cannot read zero while
+ * water is still moving (a rate needs two pulses in the same zone visit to exist at all).
+ * Rate goes in the attributes, where it still conveys urgency - 40 GPM is a burst, 2 GPM a
+ * seep.
+ *
+ * Called mid-session the moment the volume crosses the threshold, because a stuck-open
+ * valve flows continuously and the inactivity timeout that ends a session never fires.
+ * The attribute gallons figure is ungated so sub-threshold transition noise stays visible
+ * for tuning even while the state reads 0.
+ */
+void publishLeakTopic(bool isLeak, const char* context)
+{
+  sprintf(mqttMsg, "%d", isLeak ? zoneData[0].measuredZoneGallons : 0);
+  mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg, true);
+  LOG("%s %sMQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), context, IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg);
+
+  sprintf(mqttMsg, "{\"gallons\": \"%d\", \"medianGPM\": \"%.2f\", \"maxGPM\": \"%.2f\"}",
+                   zoneData[0].measuredZoneGallons,
+                   isLeak ? zoneData[0].medianGPM : 0.0f,
+                   isLeak ? zoneData[0].maxGPM : 0.0f);
+  sprintf(mqttTopic, "%s%s", IRRIG_VALVES_OFF_LEAK_TOPIC, "/attributes");
+  mqttClient.publish(mqttTopic, mqttMsg, true);
+  LOG("%s %sMQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), context, mqttTopic, mqttMsg);
 }
 
 
@@ -497,7 +588,10 @@ void resetSessionData()
 void publishSessionReport()
 {
   if (valveLastFlowPulse >= 0)
+  {
     zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
+    zoneData[valveLastFlowPulse].medianGPM = medianGPM();   // flush the final zone's rate
+  }
   mqttClient.publish(IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str(), true);
   LOG("%s MQTT SENT: %s/%s\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_REPORT_TIME_STAMP_TOPIC, myTZ.dateTime(RFC3339).c_str());
   sendTotalsReport();
@@ -737,43 +831,62 @@ boolean reconnect()
 void sendTotalsReport()
 {
   int i;
-  unsigned int valveOffLeakGals = 0, galsAllZones = 0;
+  unsigned int galsAllZones = 0;
 
-  // If any active zone (1-4) ran this session, zone-0 flow is residual pressure bleed after
-  // valve shutoff — not a leak. Only flag zone-0 as a leak for sessions where NO active zone
-  // ran (i.e., flow started with all valves off from the beginning).
-  unsigned int sessionActiveZoneGals = 0;
+  // Zone-0 classification is by VOLUME alone. The flow meter sits upstream of the whole
+  // valve manifold, so a closing valve stops flow through the meter immediately - the
+  // lateral drains downstream of a closed valve and never crosses it. There is no real
+  // bleed to excuse, only a gallon or two of transition noise between zones. A stuck-open
+  // valve passes full zone flow continuously, so volume alone separates the two.
+  // The old "was any zone 1-4 active this session" guard is deliberately gone: it dismissed
+  // ALL zone-0 flow whenever a zone had run, which is exactly what hid a stuck valve.
+  bool zone0IsLeak = (zoneData[0].measuredZoneGallons > MIN_LEAK_GALS);
+
+  // A report must be a synchronized snapshot: zones that did not run this session must not
+  // carry stale PSI from an earlier run. Read the sensor once here so every idle zone reports
+  // the same "PSI at time of non-run" instead of last week's numbers or a fake 0.00.
+  float idlePSI = readPressureSensor(READ_PRESSURE);
+  float idleTemperature = readPressureSensor(READ_TEMPERATURE);
+
+  galsAllZones = zoneData[0].measuredZoneGallons;   // zone-0 water still crossed the meter
+
+  // Zones 1-4 only - zone 0 is reported through IRRIG_VALVES_OFF_LEAK_TOPIC instead.
   for (i = 1; i <= TOT_NUM_VALVES; i++)
-    sessionActiveZoneGals += zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
-
-  for (i = 0; i < (TOT_NUM_VALVES + 1); i++)
   {
+    bool zoneRan = (zoneData[i].measuredZoneGallons > 0);
+    float reportPSI  = zoneRan ? zoneData[i].averagePSI : idlePSI;
+    float reportMaxPSI = zoneRan ? zoneData[i].maxPSI : idlePSI;
+    float reportMinPSI = zoneRan ? zoneData[i].minPSI : idlePSI;
+    float reportTemperature = zoneRan ? zoneData[i].waterTemperature : idleTemperature;
+
     // send GPM
     sprintf(mqttTopic, "%s_%d", IRRIG_GPM_TOPIC_PREFIX, i);
-    sprintf(mqttMsg, "%.2f", zoneData[i].averageGPM);
+    sprintf(mqttMsg, "%.2f", zoneData[i].medianGPM);
     mqttClient.publish(mqttTopic, mqttMsg, true);
     LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-    sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"preMeasureGallons\": \"%d\", \"measuredZoneGallons\": \"%d\", \"maxGPM\": \"%.2f\"}",
-                     zoneData[i].valveNum, zoneData[i].preMeasureGallons, zoneData[i].measuredZoneGallons, zoneData[i].maxGPM);
+    // Report the loop index, not zoneData[i].valveNum: valveNum is only assigned for a zone
+    // that actually saw flow, so idle zones would otherwise all report valve 0.
+    sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"measuredZoneGallons\": \"%d\", \"maxGPM\": \"%.2f\"}",
+                     i, zoneData[i].measuredZoneGallons, zoneData[i].maxGPM);
     sprintf(mqttTopic, "%s_%d%s", IRRIG_GPM_TOPIC_PREFIX, i, "/attributes");
     mqttClient.publish(mqttTopic, mqttMsg, true);
     LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-    // send PSI & temperature — skip entirely if sensor was unavailable this session
-    if (zoneData[i].averagePSI != PRESSURE_SENSOR_INVALID)
+    // send PSI & temperature — skip entirely if sensor was unavailable
+    if (reportPSI != PRESSURE_SENSOR_INVALID)
     {
       sprintf(mqttTopic, "%s_%d", IRRIG_PSI_TOPIC_PREFIX, i);
-      sprintf(mqttMsg, "%.2f", zoneData[i].averagePSI);
+      sprintf(mqttMsg, "%.2f", reportPSI);
       mqttClient.publish(mqttTopic, mqttMsg, true);
       LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-      if (zoneData[i].waterTemperature != PRESSURE_SENSOR_INVALID)
+      if (reportTemperature != PRESSURE_SENSOR_INVALID)
         sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\", \"waterTemperature\": \"%.2f\"}",
-                         zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI, zoneData[i].waterTemperature);
+                         i, reportMaxPSI, reportMinPSI, reportTemperature);
       else
         sprintf(mqttMsg, "{\"valveNum\": \"%d\", \"maxPSI\": \"%.2f\", \"minPSI\": \"%.2f\"}",
-                         zoneData[i].valveNum, zoneData[i].maxPSI, zoneData[i].minPSI);
+                         i, reportMaxPSI, reportMinPSI);
       sprintf(mqttTopic, "%s_%d%s", IRRIG_PSI_TOPIC_PREFIX, i, "/attributes");
       mqttClient.publish(mqttTopic, mqttMsg, true);
       LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
@@ -781,36 +894,20 @@ void sendTotalsReport()
     else
       LOG("Skipping PSI/temp MQTT publish for zone %d — sensor unavailable\n", i);
 
-    // send run duration (zones 1-4 only)
-    if (i > 0)
-    {
-      sprintf(mqttTopic, "%s_%d", IRRIG_RUN_DURATION_TOPIC_PREFIX, i);
-      sprintf(mqttMsg, "%.1f", zoneData[i].runDurationMs / 60000.0f);
-      mqttClient.publish(mqttTopic, mqttMsg, true);
-      LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
-    }
+    // send run duration
+    sprintf(mqttTopic, "%s_%d", IRRIG_RUN_DURATION_TOPIC_PREFIX, i);
+    sprintf(mqttMsg, "%.1f", zoneData[i].runDurationMs / 60000.0f);
+    mqttClient.publish(mqttTopic, mqttMsg, true);
+    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), mqttTopic, mqttMsg);
 
-    galsAllZones = galsAllZones + zoneData[i].preMeasureGallons + zoneData[i].measuredZoneGallons;
-
-    if (zoneData[i].valveNum == 0 && sessionActiveZoneGals == 0)  // zone-0 only counts as leak when no active zones ran this session
-      valveOffLeakGals = valveOffLeakGals + zoneData[i].measuredZoneGallons;
+    galsAllZones = galsAllZones + zoneData[i].measuredZoneGallons;
   }
 
   sprintf(mqttMsg, "%d", galsAllZones);
   mqttClient.publish(IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg, true);
   LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_TOTAL_GALS_ALL_ZONES_TOPIC, mqttMsg);
 
-  if (valveOffLeakGals >= MIN_LEAK_GALS)
-  {
-    sprintf(mqttMsg, "%d", valveOffLeakGals);
-    mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg, true);
-    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, mqttMsg);
-  }
-  else
-  {
-    mqttClient.publish(IRRIG_VALVES_OFF_LEAK_TOPIC, "0", true);
-    LOG("%s MQTT SENT: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_VALVES_OFF_LEAK_TOPIC, "0");
-  }
+  publishLeakTopic(zone0IsLeak, "");
 }
 
 
