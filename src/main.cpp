@@ -58,6 +58,7 @@
 #define FLOW_SETTLE_SECS 35                          // wait for empty pipe to fill and settle
 #define INACTIVITY_TIMEOUT_SECS 90                   // wait this long after last pulse before ending session - normally set to 90
 #define HEARTBEAT_SECS 1800                          // seconds between wellness check-in publishes
+#define VALVE_AC_SAMPLE_MS 25                        // valve sense window - must exceed one mains cycle (16.7ms @ 60Hz) to bridge 24VAC zero crossings
 #define WIFI_DIAGNOSTICS 0                           // set to 0 to drop the boot-time AP scan and status decoding
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
@@ -835,19 +836,31 @@ void sendPressureSensorStatus()
 
 
 /*
- * getActiveValve
+ * getActiveValve - zero means no valve is active
+ *
+ * The valves are 24VAC, so the optocoupler output is not a steady HIGH: LED current
+ * passes through zero twice per mains cycle, notching the output LOW every 8.3ms (the
+ * PS2505's anti-parallel LEDs cover both half-cycles, but not the zero crossings
+ * themselves). A single digitalRead() can land in a notch and report "no valve", which
+ * previously misfiled that gallon into zone 0 - the leak bucket. So sample across a
+ * window wider than one mains cycle and treat any HIGH seen as active.
  */
-int getActiveValve()                     // zero means no valve is active
+int getActiveValve()
 {
-  if (digitalRead(VALVE_1_PIN) == HIGH)
-    return(1);
-  if (digitalRead(VALVE_2_PIN) == HIGH)
-    return(2);
-  if (digitalRead(VALVE_3_PIN) == HIGH)
-    return(3);
-  if (digitalRead(VALVE_4_PIN) == HIGH)
-    return(4);
-  return(0);
+  unsigned long sampleStart = millis();
+  do
+  {
+    if (digitalRead(VALVE_1_PIN) == HIGH)
+      return(1);
+    if (digitalRead(VALVE_2_PIN) == HIGH)
+      return(2);
+    if (digitalRead(VALVE_3_PIN) == HIGH)
+      return(3);
+    if (digitalRead(VALVE_4_PIN) == HIGH)
+      return(4);
+    delay(1);                            // 1ms granularity is ample against an 8.3ms notch, and yields
+  } while ((millis() - sampleStart) < VALVE_AC_SAMPLE_MS);
+  return(0);                             // only reached after a full window with no valve seen
 }
 
 
