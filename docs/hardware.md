@@ -8,6 +8,7 @@
 | Flow meter | Hunter HC-100-FLOW | 1" inline, reed switch, 1 pulse per gallon |
 | Pressure sensor | TE Connectivity `M32JM-000105-100PG` | 100 PSI **gauge**, I²C, optional |
 | Valve sensing | PS2505 optocoupler ×4 | Anti-parallel LEDs — conducts on both AC half-cycles |
+| Flow debounce | LS18-P | Conditions the reed switch in hardware; firmware does no software debounce |
 | Power | 24VAC from the irrigation controller | Rectified and regulated on the carrier PCB |
 
 The `PG` suffix on the pressure sensor part number means **gauge**, not absolute. It matters:
@@ -60,8 +61,10 @@ eliminate the zero-crossing notches, because nothing can.
 
 ## Flow meter
 
-The HC-100 closes a reed switch once per gallon. The input is **active LOW with external
-pull-ups on the carrier PCB**.
+The HC-100 closes a reed switch once per gallon and is rated to **34 GPM**, so pulses arrive no
+faster than 1765 ms apart. The input is **active LOW with external pull-ups on the carrier
+PCB**, and is debounced in hardware by an **LS18-P** — the firmware does no software debounce
+and should not acquire one.
 
 The external pull-ups are a deliberate fail-safe: a severed or disconnected sensor lead floats
 HIGH, which reads as *idle*. Without them the input would float and could easily read as a
@@ -71,6 +74,12 @@ pull-up would be redundant.
 
 The meter has two leads. Only the blue one is read; the red one is wired and pulled up but the
 firmware ignores it.
+
+**The magnet can park on the reed switch.** When flow stops the impeller coasts down, and the
+magnet may come to rest holding the switch closed — the input then sits LOW with no water
+moving. Where it stops is chance, so it happens on some stops and not others. This is a normal
+resting state of a healthy sensor, and the firmware counts falling edges specifically so that it
+is a non-event. Do not treat a LOW reading at rest as a fault.
 
 ## Plumbing topology
 

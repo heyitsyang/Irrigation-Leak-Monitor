@@ -10,6 +10,7 @@ void setup_wifi();
 void setup_OTA();
 void callback(char *topic, byte *payload, unsigned int length);
 boolean reconnect();
+bool mqttAttemptConnect();
 void connectMQTT();
 void resetSessionData();
 void publishSessionReport();

@@ -103,10 +103,14 @@ Defined at the top of [src/main.cpp](../src/main.cpp).
 | `INACTIVITY_TIMEOUT_SECS` | 90 | Quiet time that ends a session. Must exceed the longest gap between pulses at your *lowest* flow rate, or one run splits into several reports. |
 | `HEARTBEAT_SECS` | 1800 | Idle publish interval. |
 | `FLOW_GALS_PER_PULSE` | 1 | Meter calibration. |
-| `FLOW_PULSE_DEBOUNCE_MS` | 50 | Blanking after each pulse to suppress reed-switch bounce. Must stay well below the pulse interval at maximum flow. |
+| `VALVE_POLL_INTERVAL_MS` | 1000 | How often idle valve changes are logged. Kept off the hot loop because `getActiveValve()` costs a full sample window when no valve is energised. |
 | `VALVE_AC_SAMPLE_MS` | 25 | Valve sense window. **Must exceed one mains cycle** — 16.7 ms at 60 Hz, 20 ms at 50 Hz. |
 | `GPM_HIST_BIN_WIDTH` | 0.25 | Median resolution. |
 | `GPM_HIST_BINS` | 600 | Together with bin width, sets the 0–150 GPM range. **Must exceed any achievable reading** or samples clamp and skew the median. |
+| `MQTT_SOCKET_TIMEOUT_SECS` | 3 | Caps a single broker connect attempt. PubSubClient defaults to 15; lowered because this call blocks the main loop, which also polls the flow sensor. |
+| `LINK_RETRY_IDLE_MS` | 5000 | Minimum gap between runtime reconnect attempts when idle. |
+| `LINK_RETRY_SESSION_MS` | 60000 | Same, but while a session is running. Longer because a blocking broker attempt can cost a counted gallon, and reports are not urgent. |
+| `MAX_MQTT_CONNECT_ATTTEMPTS` | 10 | **Boot path only.** How many times `setup()` retries before giving up and entering the main loop anyway. |
 | `MAX_PRESSURE` | 100 | Sensor full-scale, PSI. Match your part. |
 | `PRESSURE_SENSOR_INSTALLED` | 1 | Set 0 to omit the sensor entirely. |
 | `PREFER_FAHRENHEIT` | 1 | Set 0 for Celsius. |

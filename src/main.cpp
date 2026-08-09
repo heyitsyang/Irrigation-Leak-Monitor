@@ -45,8 +45,8 @@
 #define PRESSURE_SENSOR_I2C_ADDR 0x28                // TE M3200 pressure sensor
 
 // OPERATIONAL PARAMETERS & PREFERENCES
-#define FLOW_GALS_PER_PULSE  1
-#define FLOW_PULSE_DEBOUNCE_MS 50                    // blank sensor after each pulse to suppress reed switch bounce (max flow 34 GPM = 1 pulse per 1765ms)
+#define FLOW_GALS_PER_PULSE  1                       // HC-100 rated to 34 GPM, so pulses arrive no faster than 1765ms apart
+                                                     // debounce is done in hardware by an LS18-P, not here
 #define MIN_LEAK_GALS 2                              // minimum zone-0 gallons before issuing a leak notification
 #define TOT_NUM_VALVES 4
 #define PRESSURE_SENSOR_INSTALLED 1
@@ -57,6 +57,7 @@
                                                      // range must exceed any real reading - samples above it clamp into the top bin and skew the median
 #define HEARTBEAT_SECS 1800                          // seconds between wellness check-in publishes
 #define VALVE_AC_SAMPLE_MS 25                        // valve sense window - must exceed one mains cycle (16.7ms @ 60Hz) to bridge 24VAC zero crossings
+#define VALVE_POLL_INTERVAL_MS 1000                  // idle valve-change logging; keeps VALVE_AC_SAMPLE_MS out of the hot loop
 
 // LED TIMING - yellow shows link state, blue shows activity; the two are fully independent
 #define LED_BLINK_FAST_MS 100                        // yellow while connecting to WiFi; also the blue report burst rate
@@ -76,7 +77,10 @@
 // MQTT
 #define MQTT_MSG_BUFFER_SIZE 512                            // for MQTT message payload
 #define MQTT_MAX_TOPIC_SIZE 128                             // longest topic built below is ~46 chars
-#define MAX_MQTT_CONNECT_ATTTEMPTS 10
+#define MAX_MQTT_CONNECT_ATTTEMPTS 10                       // boot path only - see connectMQTT()
+#define MQTT_SOCKET_TIMEOUT_SECS 3                          // caps ONE connect attempt; PubSubClient defaults to 15
+#define LINK_RETRY_IDLE_MS 5000                             // min gap between runtime reconnect attempts when no session is running
+#define LINK_RETRY_SESSION_MS 60000                         // ...and while measuring, where a blocking attempt costs gallons
 
 #define IRRIG_LWT_TOPIC "irrig_leak/status/LWT"             // MQTT Last Will & Testament
 #define IRRIG_VERSION_TOPIC "irrig_leak/version"            // report software version at connect
@@ -120,7 +124,9 @@ struct ZoneSummary zoneData[TOT_NUM_VALVES+1];           // array to keep flow d
 
 int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
 unsigned long lastReconnectAttempt = 0;
-unsigned long sensorStuckUntilMs = 0;
+unsigned long lastLinkRetryMs = 0;         // rate limit for the runtime reconnect path in loop()
+bool flowPinWasLow = false;                // previous flow input level, for falling-edge detection
+unsigned long lastValvePollMs = 0;         // rate limit for the idle valve-change diagnostic
 unsigned long pressureLastRead = 0, lastPressErrReport = 0;
 unsigned long millisStart = 0, millisPrev = 0;
 unsigned long zoneStartMs = 0;
@@ -259,11 +265,14 @@ void loop()
     // for a static bench reading such as a zero-pressure check.
     float promptPSI = readPressureSensor(READ_PRESSURE);
     float promptTemp = readPressureSensor(READ_TEMPERATURE);
-    LOG("irrig-leak> %s | WiFi %s %ddBm | MQTT %s | zone %s | %.2f PSI | %.2f%c\n",
+    // Flow pin level is reported here rather than logged periodically: a magnet parked on the
+    // reed holds it LOW, which is normal and would only spam the log if announced on a timer.
+    LOG("irrig-leak> %s | WiFi %s %ddBm | MQTT %s | zone %s | flow pin %s | %.2f PSI | %.2f%c\n",
       myTZ.dateTime("[Y-m-d H:i:s]").c_str(),
       WiFi.SSID().c_str(), WiFi.RSSI(),
       mqttClient.connected() ? "OK" : "LOST",
       sessionActive ? "ACTIVE" : "idle",
+      digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW ? "LOW (closed)" : "HIGH (open)",
       promptPSI, promptTemp, PREFER_FAHRENHEIT ? 'F' : 'C');
   }
 
@@ -271,14 +280,40 @@ void loop()
 
   // Reconnect WiFi/MQTT if dropped. The yellow LED needs no help here - updateLEDs() reads
   // the live link state every pass, so it drops to blinking on its own.
+  //
+  // This path is deliberately stingy, because loop() also polls the flow sensor. calling
+  // connectMQTT() here used to block for up to MAX_MQTT_CONNECT_ATTTEMPTS x the socket
+  // timeout - over two minutes at PubSubClient's 15s default. That is longer than
+  // INACTIVITY_TIMEOUT_SECS, so a single outage could both miss flow pulses AND time out a
+  // live session mid-irrigation, fragmenting one run into several reports. Three guards:
+  //   1. rate limit, so a sustained outage does not retry (or log) every pass
+  //   2. else-if, so the broker is never chased over a dead network
+  //   3. ONE attempt per pass via mqttAttemptConnect(), bounded by MQTT_SOCKET_TIMEOUT_SECS
+  //
+  // Guard 1 backs off hard WHILE MEASURING. MQTT_SOCKET_TIMEOUT_SECS still exceeds the 1765ms
+  // minimum pulse interval at the meter's rated 34 GPM, so every attempt made during a run can
+  // cost a gallon. Retrying once a minute instead of every 5s keeps that under ~5% of the time
+  // rather than most of it. The reports are not urgent - they only have to arrive eventually -
+  // whereas a missed gallon is gone for good. Only MQTT needs this: WiFi.reconnect() does not
+  // block, so it stays prompt either way.
   if (WiFi.status() != WL_CONNECTED)
   {
-    LOG("WiFi lost, reconnecting...\n");
-    WiFi.reconnect();
+    if ((unsigned long)(millis() - lastLinkRetryMs) >= LINK_RETRY_IDLE_MS)
+    {
+      lastLinkRetryMs = millis();
+      LOG("WiFi lost, reconnecting...\n");
+      WiFi.reconnect();
+    }
   }
-  if (!mqttClient.connected())
+  else if (!mqttClient.connected())
   {
-    connectMQTT();
+    if ((unsigned long)(millis() - lastLinkRetryMs) >=
+        (sessionActive ? LINK_RETRY_SESSION_MS : LINK_RETRY_IDLE_MS))
+    {
+      lastLinkRetryMs = millis();
+      LOG("MQTT lost, reconnecting...\n");
+      mqttAttemptConnect();
+    }
   }
   mqttClient.loop();
 
@@ -299,8 +334,35 @@ void loop()
     sendPressureSensorStatus();
   }
 
-  // Flow detection
-  if (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW && millis() >= sensorStuckUntilMs)   // pulse is active when LOW
+  // Flow detection - EDGE triggered, on the falling edge only.
+  //
+  // When flow stops the impeller coasts to a halt, and the magnet can come to rest parked on
+  // the reed switch, holding this input LOW indefinitely. It does not happen every time - where
+  // the magnet stops is chance - but over enough runs it is bound to, so it is a NORMAL resting
+  // state of a healthy sensor rather than a fault to detect.
+  //
+  // Level triggering cannot express that. The previous version blocked in a wait-for-release
+  // loop, so a parked magnet stalled the loop for INACTIVITY_TIMEOUT_SECS and then published an
+  // all-zero session report (it returned before gallons were ever recorded), repeating every
+  // ~180s and overwriting good retained data in Home Assistant with zeros.
+  //
+  // Counting the falling edge instead makes a parked magnet a non-event: no new edge means no
+  // new pulse, the session ends normally through the inactivity timeout below, and the report
+  // carries the real gallons measured before the magnet stopped. One edge counts exactly one
+  // gallon however long the closure lasts.
+  //
+  // There is NO software debounce: an LS18-P debounce IC conditions the reed switch on the
+  // carrier PCB, so this input is already clean. If phantom gallons ever appear, that is a
+  // hardware signal-integrity problem to fix at the source, not something to paper over here.
+  //
+  // Timing margin: the HC-100 gives 1 pulse per gallon and is rated to 34 GPM, so pulses can
+  // arrive no faster than 60/34 = 1765ms apart. loop() runs in a few ms while a valve is
+  // energised, which is ~500x margin on sampling the input often enough to see every edge.
+  bool flowPinLow = (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW);
+  bool flowPulseEdge = (flowPinLow && !flowPinWasLow);
+  flowPinWasLow = flowPinLow;
+
+  if (flowPulseEdge)
   {
     if (!sessionActive)
     {
@@ -367,24 +429,6 @@ void loop()
 
     millisStart = millis();
 
-    // Wait out the reed switch closure. This can run up to INACTIVITY_TIMEOUT_SECS on a stuck
-    // magnet, so updateLEDs() must run inside it or both LEDs freeze for 90 seconds.
-    while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)
-    {
-      ArduinoOTA.handle();
-      updateLEDs();
-      if ((millis() - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000UL))  // magnet stuck on LOW
-      {
-        LOG("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW\n");
-        sensorStuckUntilMs = millis() + (INACTIVITY_TIMEOUT_SECS * 1000UL);
-        publishSessionReport();
-        sessionActive = false;
-        return;
-      }
-      yield();
-    }
-    sensorStuckUntilMs = millis() + FLOW_PULSE_DEBOUNCE_MS;  // suppress reed switch bounce on rising edge
-
     unsigned long millisElapsed = (millisPrev > 0) ? (millisStart - millisPrev) : 0;
 
     // Gallons are recorded on EVERY pulse, unconditionally. Previously this lived inside a
@@ -435,7 +479,7 @@ void loop()
     millisPrev = millisStart;
     valveLastFlowPulse = valveThisFlowPulse;
   }
-  else  // no flow — check for session inactivity timeout
+  else  // no new pulse this pass - the input may be HIGH, or LOW with the magnet parked on it
   {
     if (sessionActive && ((millis() - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000UL)))
     {
@@ -445,8 +489,15 @@ void loop()
     }
     yield();
 
+    // Diagnostic only: log valve changes seen with no flow. Rate limited because
+    // getActiveValve() costs a full VALVE_AC_SAMPLE_MS whenever no valve is energised, and
+    // that is exactly when it runs. Flow detection above samples the input once per loop pass,
+    // so a slow loop can step over a short reed closure entirely - and the no-valve case is
+    // zone 0, the one that matters most. Polling this on a timer keeps the idle loop fast.
+    if ((unsigned long)(millis() - lastValvePollMs) >= VALVE_POLL_INTERVAL_MS)
     {
-      static int lastValvePollResult = getActiveValve();
+      static int lastValvePollResult = -1;
+      lastValvePollMs = millis();
       int polledValve = getActiveValve();
       if (polledValve != lastValvePollResult)
       {
@@ -855,7 +906,33 @@ void setup_OTA()
 
 
 /*
- * connectMQTT
+ * mqttAttemptConnect - exactly ONE connect attempt, announcing success on the LWT topic.
+ *
+ * Shared by the boot path and the loop path so the two cannot disagree about LWT state: the
+ * broker's Last Will publishes "Disconnected" on an ungraceful drop, so whoever reconnects
+ * must publish "Connected" or Home Assistant is left believing the device is still offline.
+ *
+ * Blocking time is bounded by MQTT_SOCKET_TIMEOUT_SECS, which is what makes this safe to call
+ * from loop() where connectMQTT() was not.
+ */
+bool mqttAttemptConnect()
+{
+  if (!reconnect())
+    return(false);
+
+  mqttClient.publish(IRRIG_LWT_TOPIC, "Connected", true);
+  LOG("\n%s MQTT SENT: %s/Connected\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_LWT_TOPIC);
+  return(true);
+}
+
+
+/*
+ * connectMQTT - the BOOT path: keep trying until connected or attempts are exhausted.
+ *
+ * Blocking is acceptable here because nothing else is happening yet. Do NOT call this from
+ * loop() - see the reconnect block there for why. It also performs the one-time client
+ * configuration that mqttAttemptConnect() relies on, which is safe because setup() always
+ * calls it before loop() runs.
  */
 void connectMQTT()
 {
@@ -863,6 +940,7 @@ void connectMQTT()
   mqttClient.setBufferSize(MQTT_MSG_BUFFER_SIZE);
   mqttClient.setServer(MQTT_SERVER, 1883);
   mqttClient.setCallback(callback);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SECS);
   while (connectAttemptCount < MAX_MQTT_CONNECT_ATTTEMPTS)
   {
     ArduinoOTA.handle();
@@ -875,10 +953,8 @@ void connectMQTT()
         LOG("[%s] Waiting for MQTT...\n", myTZ.dateTime(RFC3339).c_str());
         lastReconnectAttempt = mqttNow;
         connectAttemptCount++;
-        if (reconnect())
+        if (mqttAttemptConnect())
         {
-          mqttClient.publish(IRRIG_LWT_TOPIC, "Connected", true);
-          LOG("\n%s MQTT SENT: %s/Connected\n", myTZ.dateTime("[H:i:s.v]").c_str(), IRRIG_LWT_TOPIC);
           lastReconnectAttempt = 0;
           return;
         }
