@@ -14,6 +14,8 @@ void connectMQTT();
 void resetSessionData();
 void publishSessionReport();
 
+void updateLEDs();
+
 int getActiveValve();
 void resetGPMHistogram();
 void addGPMSample(float gpm);

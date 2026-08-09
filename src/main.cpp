@@ -32,8 +32,8 @@
 #define VERSION "Ver 0.4 build 2026.08.1"
 
 // GPIO PIN DEFINITIONS
-#define BUILT_IN_LED_PIN 21                         // yellow
-#define STATUS_LED_PIN 7                            // blue
+#define BUILT_IN_LED_PIN 21                         // yellow - link status, ACTIVE LOW
+#define STATUS_LED_PIN 7                            // blue - flow/report activity, ACTIVE HIGH
 
 #define VALVE_1_PIN 4
 #define VALVE_2_PIN 3
@@ -61,6 +61,13 @@
                                                      // range must exceed any real reading - samples above it clamp into the top bin and skew the median
 #define HEARTBEAT_SECS 1800                          // seconds between wellness check-in publishes
 #define VALVE_AC_SAMPLE_MS 25                        // valve sense window - must exceed one mains cycle (16.7ms @ 60Hz) to bridge 24VAC zero crossings
+
+// LED TIMING - yellow shows link state, blue shows activity; the two are fully independent
+#define LED_BLINK_FAST_MS 100                        // yellow while connecting to WiFi; also the blue report burst rate
+#define LED_BLINK_SLOW_MS 500                        // yellow while WiFi is up but MQTT is down
+#define FLOW_PULSE_LED_MS 500                        // blue dwell per flow pulse - fixed, NOT tied to reed closure length (see updateLEDs)
+#define REPORT_BLINK_MS 5000                         // blue burst duration when a session report is published
+
 #define WIFI_DIAGNOSTICS 0                           // set to 0 to drop the boot-time AP scan and status decoding
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
 #define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
@@ -139,8 +146,14 @@ unsigned int gpmSampleCount = 0;
 bool leakAlertSent = false;           // interim alert fires once per session
 
 bool sessionActive = false;
-bool connectedOK = false;
 unsigned long lastHeartbeatMs = 0;
+
+// LED state. Both blue deadlines are absolute millis() values, compared as a signed
+// difference against 0 so they stay correct across the 49-day millis() wrap.
+unsigned long flowLedOffMs = 0;            // 0 = blue idle
+unsigned long reportBlinkUntilMs = 0;      // 0 = not reporting; outranks the flow one-shot
+unsigned long lastBlueToggleMs = 0;
+bool blueLit = false;
 std::atomic<bool> webSerialPromptRequested{false};
 
 #define PRECONNECT_LOG_BUF_SIZE 2048
@@ -165,11 +178,10 @@ void setup()
   pinMode(BUILT_IN_LED_PIN, OUTPUT);
   digitalWrite(BUILT_IN_LED_PIN, HIGH);       // onboard LED is active LOW - HIGH = off
   pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);          // blue is activity-only - dark until flow or a report
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_BUS_FREQ_HZ);
-
-  digitalWrite(STATUS_LED_PIN, HIGH);       // LED on during init
 
   resetSessionData();
   millisStart = millis();
@@ -187,8 +199,7 @@ void setup()
   myTZ.setLocation(F(MY_TIMEZONE));
   LOG("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
   connectMQTT();
-  connectedOK = (WiFi.status() == WL_CONNECTED && mqttClient.connected());
-  digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);
+  updateLEDs();
 
   mqttClient.loop();  // keep connection alive after waitForSync() blocking call
   mqttClient.publish(IRRIG_VERSION_TOPIC, VERSION, true);
@@ -226,6 +237,7 @@ void setup()
 void loop()
 {
   WebSerial.loop();
+  updateLEDs();
 
   {
     static bool wsWasConnected = false;
@@ -261,17 +273,16 @@ void loop()
 
   ArduinoOTA.handle();
 
-  // Reconnect WiFi/MQTT if dropped; LED driven at drop/connect events
+  // Reconnect WiFi/MQTT if dropped. The yellow LED needs no help here - updateLEDs() reads
+  // the live link state every pass, so it drops to blinking on its own.
   if (WiFi.status() != WL_CONNECTED)
   {
     LOG("WiFi lost, reconnecting...\n");
-    if (connectedOK) { connectedOK = false; digitalWrite(STATUS_LED_PIN, HIGH); }
     WiFi.reconnect();
   }
   if (!mqttClient.connected())
   {
-    if (connectedOK) { connectedOK = false; digitalWrite(STATUS_LED_PIN, HIGH); }
-    connectMQTT();   // reconnect() inside sets connectedOK=true and LED LOW on success
+    connectMQTT();
   }
   mqttClient.loop();
 
@@ -302,6 +313,9 @@ void loop()
       zoneStartMs = millis();
       LOG("\n--- Irrigation session started ---\n");
     }
+
+    digitalWrite(STATUS_LED_PIN, HIGH);                   // blue on for this pulse
+    flowLedOffMs = millis() + FLOW_PULSE_LED_MS;          // updateLEDs() turns it back off
 
     currentPressure = readPressureSensor(READ_PRESSURE);
     if (currentPressure != PRESSURE_SENSOR_INVALID)
@@ -362,31 +376,22 @@ void loop()
 
     millisStart = millis();
 
+    // Wait out the reed switch closure. This can run up to INACTIVITY_TIMEOUT_SECS on a stuck
+    // magnet, so updateLEDs() must run inside it or both LEDs freeze for 90 seconds.
+    while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)
     {
-      unsigned long blinkStart = millis();
-      bool blinkActive = true;
-      digitalWrite(STATUS_LED_PIN, connectedOK ? HIGH : LOW);   // blink state
-      while (digitalRead(FLOW_SENSOR_BLUE_PIN) == LOW)
+      ArduinoOTA.handle();
+      updateLEDs();
+      millisNow = millis();
+      if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
       {
-        ArduinoOTA.handle();
-        millisNow = millis();
-        if (blinkActive && (millisNow - blinkStart) >= 500)
-        {
-          blinkActive = false;
-          digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);  // return to rest
-        }
-        if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
-        {
-          LOG("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW\n");
-          digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);  // restore rest state
-          sensorStuckUntilMs = millis() + (INACTIVITY_TIMEOUT_SECS * 1000UL);
-          publishSessionReport();
-          sessionActive = false;
-          return;
-        }
-        yield();
+        LOG("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW\n");
+        sensorStuckUntilMs = millis() + (INACTIVITY_TIMEOUT_SECS * 1000UL);
+        publishSessionReport();
+        sessionActive = false;
+        return;
       }
-      digitalWrite(STATUS_LED_PIN, connectedOK ? LOW : HIGH);    // restore rest state
+      yield();
     }
     sensorStuckUntilMs = millis() + FLOW_PULSE_DEBOUNCE_MS;  // suppress reed switch bounce on rising edge
 
@@ -514,6 +519,72 @@ void resetSessionData()
 
 
 /*
+ * updateLEDs - drives both LEDs. Non-blocking and idempotent, so it is safe to call at any
+ *              rate; it must be called from every blocking wait or the LEDs freeze there.
+ *
+ *   yellow (BUILT_IN_LED_PIN, active LOW)  fast blink = connecting to WiFi
+ *                                          slow blink = WiFi up, MQTT down
+ *                                          solid      = both up
+ *   blue   (STATUS_LED_PIN, active HIGH)   fixed 500ms per flow pulse, rapid burst while a
+ *                                          session report is published, dark otherwise
+ *
+ * The blue flow blip is a one-shot deliberately DECOUPLED from the reed switch closure. Tying
+ * it to the closure makes the LED's visibility depend on the meter's magnet geometry, and a
+ * brief contact would produce a flash too short to catch. 500ms is always legible.
+ *
+ * The yellow state is derived live from WiFi/MQTT on every call rather than cached in a flag.
+ * The old connectedOK flag was updated only at drop/connect events, so any state change the
+ * event handlers missed left the LED lying until the next one.
+ */
+void updateLEDs()
+{
+  static unsigned long lastLinkToggleMs = 0;
+  static bool linkLit = false;
+  unsigned long now = millis();
+
+  // --- yellow: link state ---
+  unsigned long period;
+  if (WiFi.status() != WL_CONNECTED)  period = LED_BLINK_FAST_MS;
+  else if (!mqttClient.connected())   period = LED_BLINK_SLOW_MS;
+  else                                period = 0;                // solid
+
+  if (period == 0)
+  {
+    if (!linkLit) { linkLit = true; digitalWrite(BUILT_IN_LED_PIN, LOW); }   // active LOW
+  }
+  else if ((unsigned long)(now - lastLinkToggleMs) >= period)
+  {
+    lastLinkToggleMs = now;
+    linkLit = !linkLit;
+    digitalWrite(BUILT_IN_LED_PIN, linkLit ? LOW : HIGH);
+  }
+
+  // --- blue: the report burst outranks the flow one-shot ---
+  if (reportBlinkUntilMs)
+  {
+    if ((long)(now - reportBlinkUntilMs) >= 0)
+    {
+      reportBlinkUntilMs = 0;
+      flowLedOffMs = 0;              // drop any pulse latch stranded by the burst
+      blueLit = false;
+      digitalWrite(STATUS_LED_PIN, LOW);
+    }
+    else if ((unsigned long)(now - lastBlueToggleMs) >= LED_BLINK_FAST_MS)
+    {
+      lastBlueToggleMs = now;
+      blueLit = !blueLit;
+      digitalWrite(STATUS_LED_PIN, blueLit ? HIGH : LOW);        // active HIGH
+    }
+  }
+  else if (flowLedOffMs && (long)(now - flowLedOffMs) >= 0)
+  {
+    digitalWrite(STATUS_LED_PIN, LOW);
+    flowLedOffMs = 0;
+  }
+}
+
+
+/*
  * resetGPMHistogram / addGPMSample / medianGPM
  *
  * The zone average is a median rather than a mean so the pipe-fill spike at the start of a
@@ -597,6 +668,13 @@ void publishLeakTopic(bool isLeak, const char* context)
  */
 void publishSessionReport()
 {
+  // Announce the report on the blue LED. The publishes below are synchronous and finish in
+  // milliseconds, and updateLEDs() does not run during them, so this is a fixed-duration
+  // burst that plays out in loop() afterward - not a progress indicator.
+  reportBlinkUntilMs = millis() + REPORT_BLINK_MS;
+  lastBlueToggleMs = 0;                     // start the burst on a clean edge
+  blueLit = false;
+
   if (valveLastFlowPulse >= 0)
   {
     zoneData[valveLastFlowPulse].runDurationMs += millis() - zoneStartMs;
@@ -713,19 +791,28 @@ void setup_wifi()
   Serial.print(F("\nWaiting for WiFi "));
   pauseTick = millis();
   unsigned long lastStatusTick = millis();
+  unsigned long lastDotTick = 0;               // 0 so the first dot prints immediately
   while (WiFi.status() != WL_CONNECTED)
   {
     if ((millis() - pauseTick) >= 90000)
       ESP.restart();
-    Serial.print(F("."));
-#if WIFI_DIAGNOSTICS
-    if ((millis() - lastStatusTick) >= 5000)     // periodic so the dots stay readable
+
+    // Polled rather than delay(500): a 100ms blink cannot happen inside a half-second delay.
+    // The dot cadence and the 90s restart watchdog above are unchanged.
+    if (lastDotTick == 0 || (millis() - lastDotTick) >= 500)
     {
-      lastStatusTick = millis();
-      LOG("\n  status=%s\n", wifiStatusName(WiFi.status()));
-    }
+      lastDotTick = millis();
+      Serial.print(F("."));
+#if WIFI_DIAGNOSTICS
+      if ((millis() - lastStatusTick) >= 5000)     // periodic so the dots stay readable
+      {
+        lastStatusTick = millis();
+        LOG("\n  status=%s\n", wifiStatusName(WiFi.status()));
+      }
 #endif
-    delay(500);
+    }
+    updateLEDs();
+    delay(10);
   }
 
   Serial.println(F(""));
@@ -787,6 +874,7 @@ void connectMQTT()
   while (connectAttemptCount < MAX_MQTT_CONNECT_ATTTEMPTS)
   {
     ArduinoOTA.handle();
+    updateLEDs();          // this is the yellow slow-blink window: WiFi up, MQTT not yet
     if (!mqttClient.connected())
     {
       mqttNow = millis();
@@ -827,9 +915,8 @@ boolean reconnect()
 {
   if (mqttClient.connect(DEVICE_HOST_NAME, MQTT_USER_NAME, MQTT_PASSWORD, IRRIG_LWT_TOPIC, 2, true, "Disconnected"))
   {
-    connectedOK = true;
-    digitalWrite(STATUS_LED_PIN, LOW);    // LED OFF immediately on successful connect
     LOG("MQTT connected to %s\n", MQTT_SERVER);
+    updateLEDs();          // yellow goes solid now that both links are up
   }
   return mqttClient.connected();
 }
