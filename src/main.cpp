@@ -6,11 +6,7 @@
 
 #include <Arduino.h>
 #include <atomic>
-#ifdef ESP32
-  #include <WiFi.h>
-#else
-  #include <ESP8266WiFi.h>
-#endif
+#include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <Wire.h>
 // add the below libraries from the Library Manager
@@ -21,7 +17,7 @@
 
 // local definitions
 #include "prototypes.h"
-#include "credentials.h"     // <<<<<<<  COMMENT THIS LINE OUT & ENTER YOUR CREDENTIALS BELOW - this contains stuff for my WIFI network, not yours
+#include "credentials.h"     // <<<<<<< not in the repo - supply WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER, MQTT_USER_NAME, MQTT_PASSWORD
 
 // name the device
 #define DEVICE_HOST_NAME "irrig-leak"
@@ -40,8 +36,8 @@
 #define VALVE_3_PIN 2
 #define VALVE_4_PIN 1
 
-#define FLOW_SENSOR_BLUE_PIN 43                       // Hunter HC100FLOW flow meter - ACTIVE LOW
-#define FLOW_SENSOR_RED_PIN 44
+#define FLOW_SENSOR_BLUE_PIN 43                       // Hunter HC100FLOW flow meter - ACTIVE LOW, 1 pulse/gallon
+#define FLOW_SENSOR_RED_PIN 44                        // second meter lead - wired and pulled up, not read by the firmware
 
 #define I2C_SCL_PIN 6
 #define I2C_SDA_PIN 5
@@ -70,8 +66,8 @@
 
 #define WIFI_DIAGNOSTICS 0                           // set to 0 to drop the boot-time AP scan and status decoding
 #define MAX_PRESSURE 100                             // max rated pressure of pressure sensor
-#define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is published if error condition persists
-#define PRESSURE_READ_INTERVAL_MS 0                   // minimum ms between I2C reads (0 = read every call)
+#define PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS 60000  // how often a pressure sensor error is logged if the error condition persists
+#define PRESSURE_READ_INTERVAL_MS 0                  // minimum ms between I2C reads (0 = read every call)
 #define PRESSURE_SENSOR_INVALID -99.0f               // sentinel returned when sensor is unavailable
 #define M3200_STATUS_NORMAL 0                        // top 2 bits of the pressure word: valid data
 #define M3200_STATUS_STALE 2                         // no new conversion since last read - benign, retry
@@ -79,7 +75,7 @@
 
 // MQTT
 #define MQTT_MSG_BUFFER_SIZE 512                            // for MQTT message payload
-#define MQTT_MAX_TOPIC_SIZE 1024                            // max topic string size(can be up to 65535)
+#define MQTT_MAX_TOPIC_SIZE 128                             // longest topic built below is ~46 chars
 #define MAX_MQTT_CONNECT_ATTTEMPTS 10
 
 #define IRRIG_LWT_TOPIC "irrig_leak/status/LWT"             // MQTT Last Will & Testament
@@ -96,14 +92,13 @@
 #define IRRIG_PSI_TOPIC_PREFIX "irrig_leak/report/avg_psi_zone"  // valve/zone number is appended to the end to create the complete topic
 #define IRRIG_RUN_DURATION_TOPIC_PREFIX "irrig_leak/report/run_dur_zone"  // valve/zone number is appended to the end to create the complete topic
 
-#define IRRIG_RECV_COMMAND_TOPIC "irrig_leak/cmd/#"
 #define READ_TEMPERATURE 1  // pass to readPressureSensor() to return temperature
 #define READ_PRESSURE 0     // pass to readPressureSensor() to return pressure
 
 struct ZoneSummary
 {
-  u_int valveNum;
-  u_int measuredZoneGallons;
+  unsigned int valveNum;
+  unsigned int measuredZoneGallons;
   float medianGPM;
   float maxGPM;
   float averagePSI;
@@ -127,18 +122,20 @@ int valveThisFlowPulse = 0, valveLastFlowPulse = -1;
 unsigned long lastReconnectAttempt = 0;
 unsigned long sensorStuckUntilMs = 0;
 unsigned long pressureLastRead = 0, lastPressErrReport = 0;
-unsigned long millisNow, millisStart = 0, millisPrev = 0, millisElapsed;
+unsigned long millisStart = 0, millisPrev = 0;
 unsigned long zoneStartMs = 0;
-unsigned long pressureReadNow, mqttNow, lastPressErrReportNow;
-byte sensorStatus;
-float psiTminus0 = 0;
-float avgPressure, maxPressure, minPressure, currentPressure, temperature, runningTotPressure = 0;
+
+// The last good reading from the M3200. Both are filled from a single 4-byte I2C transaction
+// but readPressureSensor() can only return one of them, so the other has to survive the call.
+float sensorPSI = 0;
+float sensorTempC = 0;
+
+float avgPressure, maxPressure, minPressure, currentPressure, runningTotPressure = 0;
 unsigned int validPressureReadCount = 0;
 float instantGPM = 0, zoneMedianGPM, maxGPM;
-unsigned int flowPulseCount = 0;
 
 // GPM histogram for the current zone. A median over the whole run needs unbounded storage
-// if kept as samples, so bin instead: fixed 400 bytes, and unlike a ring buffer of recent
+// if kept as samples, so bin instead: fixed 1200 bytes, and unlike a ring buffer of recent
 // pulses it does not quietly redefine "average GPM" as "recent GPM".
 uint16_t gpmHistogram[GPM_HIST_BINS];
 unsigned int gpmSampleCount = 0;
@@ -194,7 +191,6 @@ void setup()
   server.begin();
   setup_OTA();
   LOG("\n\n\nIrrigation Leak Detector %s\n", VERSION);
-  LOG("Size of struct ZoneSummary = %d\n", sizeof(ZoneSummary));
   waitForSync();  // sync the time; ezTime will re-sync periodically on its own schedule
   myTZ.setLocation(F(MY_TIMEZONE));
   LOG("Got local time: %s\n", myTZ.dateTime("[H:i:s.v]").c_str());
@@ -339,7 +335,6 @@ void loop()
         zoneData[valveLastFlowPulse].medianGPM = medianGPM();   // flush outgoing zone's rate
       }
       zoneStartMs = millis();
-      flowPulseCount = 1;
       resetGPMHistogram();
       // The interval into this pulse spans the valve changeover, not flow through the new
       // zone - it produced 4 GPM from a 14s gap and 94 GPM from a 637ms one. Clearing
@@ -363,15 +358,11 @@ void loop()
       maxGPM = 0;
       zoneMedianGPM = 0;
     }
-    else
+    else if (currentPressure != PRESSURE_SENSOR_INVALID)
     {
-      flowPulseCount++;
-      if (currentPressure != PRESSURE_SENSOR_INVALID)
-      {
-        runningTotPressure += currentPressure;
-        validPressureReadCount++;
-        avgPressure = runningTotPressure / validPressureReadCount;
-      }
+      runningTotPressure += currentPressure;
+      validPressureReadCount++;
+      avgPressure = runningTotPressure / validPressureReadCount;
     }
 
     millisStart = millis();
@@ -382,8 +373,7 @@ void loop()
     {
       ArduinoOTA.handle();
       updateLEDs();
-      millisNow = millis();
-      if ((millisNow - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000))  // magnet stuck on LOW
+      if ((millis() - millisStart) > (INACTIVITY_TIMEOUT_SECS * 1000UL))  // magnet stuck on LOW
       {
         LOG("\nINACTIVITY_TIMEOUT_SECS while FLOW_SENSOR_BLUE_PIN stuck LOW\n");
         sensorStuckUntilMs = millis() + (INACTIVITY_TIMEOUT_SECS * 1000UL);
@@ -395,11 +385,11 @@ void loop()
     }
     sensorStuckUntilMs = millis() + FLOW_PULSE_DEBOUNCE_MS;  // suppress reed switch bounce on rising edge
 
-    millisElapsed = (millisPrev > 0) ? (millisStart - millisPrev) : 0;
+    unsigned long millisElapsed = (millisPrev > 0) ? (millisStart - millisPrev) : 0;
 
     // Gallons are recorded on EVERY pulse, unconditionally. Previously this lived inside a
     // settle-window gate, so a run shorter than the window recorded nothing at all.
-    // Accumulate rather than assign flowPulseCount: if a zone is ever revisited within a
+    // Accumulate rather than assign a per-visit counter: if a zone is revisited within a
     // session, assigning would reset its total back to 1 and lose everything before it.
     zoneData[valveThisFlowPulse].measuredZoneGallons += FLOW_GALS_PER_PULSE;
     zoneData[valveThisFlowPulse].averagePSI = avgPressure;
@@ -420,13 +410,15 @@ void loop()
       zoneData[valveThisFlowPulse].maxGPM = maxGPM;
     }
 
-
     // Flow and pressure are unrelated measurements - the reed switch counts gallons, the
     // M3200 reads PSI - so they get a line each. runningTotPressure is deliberately not
     // logged: it is only the numerator of avgPressure, and a SUM of pressures is not a
     // physical quantity (unlike gallons, PSI is intensive - averageable, not addable).
+    // Gallons come from the zone accumulator, not a per-visit pulse count: the old counter
+    // restarted at 1 on every zone change, so a revisited zone under-reported in the log.
     LOG("flow:  zone = %d  gallons = %d  millisElapsed = %lu  instantGPM = %.2f  medianGPM = %.2f  maxGPM = %.2f\n",
-                 valveThisFlowPulse, flowPulseCount, millisElapsed, instantGPM, zoneMedianGPM, maxGPM);
+                 valveThisFlowPulse, zoneData[valveThisFlowPulse].measuredZoneGallons,
+                 millisElapsed, instantGPM, zoneMedianGPM, maxGPM);
     LOG("press: currentPressure = %.2f  avgPressure = %.2f  maxPressure = %.2f  minPressure = %.2f  temperature = %.2f%c\n",
                  currentPressure, avgPressure, maxPressure, minPressure,
                  zoneData[valveThisFlowPulse].waterTemperature, PREFER_FAHRENHEIT ? 'F' : 'C');
@@ -501,8 +493,6 @@ void LOG(const char* fmt, ...)
 void resetSessionData()
 {
   memset(zoneData, 0, sizeof(zoneData));
-  flowPulseCount = 0;
-  millisElapsed = 0;
   millisPrev = 0;
   avgPressure = PRESSURE_SENSOR_INVALID;
   maxPressure = PRESSURE_SENSOR_INVALID;
@@ -790,8 +780,10 @@ void setup_wifi()
 
   Serial.print(F("\nWaiting for WiFi "));
   pauseTick = millis();
-  unsigned long lastStatusTick = millis();
   unsigned long lastDotTick = 0;               // 0 so the first dot prints immediately
+#if WIFI_DIAGNOSTICS
+  unsigned long lastStatusTick = millis();
+#endif
   while (WiFi.status() != WL_CONNECTED)
   {
     if ((millis() - pauseTick) >= 90000)
@@ -877,7 +869,7 @@ void connectMQTT()
     updateLEDs();          // this is the yellow slow-blink window: WiFi up, MQTT not yet
     if (!mqttClient.connected())
     {
-      mqttNow = millis();
+      unsigned long mqttNow = millis();
       if (mqttNow - lastReconnectAttempt > 1000)
       {
         LOG("[%s] Waiting for MQTT...\n", myTZ.dateTime(RFC3339).c_str());
@@ -898,12 +890,15 @@ void connectMQTT()
 
 
 /*
- * MQTT callback
+ * MQTT callback - registered but currently inert: nothing is subscribed, so this never fires.
+ *                 Kept as the landing point for future irrig_leak/cmd/# handling.
  */
 void callback(char *topic, byte *payload, unsigned int length)
 {
-  strncpy(mqttMsg, (char *)payload, length);
-  mqttMsg[length] = (char)NULL;
+  if (length >= sizeof(mqttMsg))            // payload is not NUL-terminated; never trust its length
+    length = sizeof(mqttMsg) - 1;
+  memcpy(mqttMsg, payload, length);
+  mqttMsg[length] = '\0';
   LOG("\n%s MQTT RECVD: %s/%s \n", myTZ.dateTime("[H:i:s.v]").c_str(), topic, mqttMsg);
 }
 
@@ -927,8 +922,6 @@ boolean reconnect()
  */
 void sendTotalsReport()
 {
-  int i;
-  unsigned int galsAllZones = 0;
 
   // Zone-0 classification is by VOLUME alone. The flow meter sits upstream of the whole
   // valve manifold, so a closing valve stops flow through the meter immediately - the
@@ -945,10 +938,10 @@ void sendTotalsReport()
   float idlePSI = readPressureSensor(READ_PRESSURE);
   float idleTemperature = readPressureSensor(READ_TEMPERATURE);
 
-  galsAllZones = zoneData[0].measuredZoneGallons;   // zone-0 water still crossed the meter
+  unsigned int galsAllZones = zoneData[0].measuredZoneGallons;   // zone-0 water still crossed the meter
 
   // Zones 1-4 only - zone 0 is reported through IRRIG_VALVES_OFF_LEAK_TOPIC instead.
-  for (i = 1; i <= TOT_NUM_VALVES; i++)
+  for (int i = 1; i <= TOT_NUM_VALVES; i++)
   {
     bool zoneRan = (zoneData[i].measuredZoneGallons > 0);
     float reportPSI  = zoneRan ? zoneData[i].averagePSI : idlePSI;
@@ -1065,13 +1058,12 @@ float readPressureSensor(int pressOrtemp)
 {
   if (PRESSURE_SENSOR_INSTALLED)
   {
-    sensorStatus = 0xFF; // set to non-zero for initial while() test
-    pressureReadNow = millis();
-    if ((unsigned long)(pressureReadNow - pressureLastRead) > PRESSURE_READ_INTERVAL_MS)
+    byte sensorStatus = 0xFF;                 // non-zero so the while() runs at least once
+    if ((unsigned long)(millis() - pressureLastRead) > PRESSURE_READ_INTERVAL_MS)
     {
       pressureLastRead = millis();
       int retries = 0;
-      while (sensorStatus != 0 && retries++ < 5) // retry up to 5x for stale status; sensor updates every ~2ms
+      while (sensorStatus != M3200_STATUS_NORMAL && retries++ < 5)  // stale clears in ~2ms
       {
         Wire.requestFrom(PRESSURE_SENSOR_I2C_ADDR, 4);
         int n = Wire.available();
@@ -1097,13 +1089,12 @@ float readPressureSensor(int pressOrtemp)
           // exactly like a valid one.
           if (sensorStatus == M3200_STATUS_NORMAL)
           {
-            psiTminus0 = ((rawP - 1638.0) / (14746.0 - 1638.0)) * MAX_PRESSURE;
-            temperature = ((rawT - 512.0) / (1075.0 - 512.0)) * 55.0;
+            sensorPSI = ((rawP - 1638.0) / (14746.0 - 1638.0)) * MAX_PRESSURE;
+            sensorTempC = ((rawT - 512.0) / (1075.0 - 512.0)) * 55.0;
           }
           else if (sensorStatus == M3200_STATUS_FAULT)
           {
-            lastPressErrReportNow = millis();
-            if ((unsigned long)(lastPressErrReportNow - lastPressErrReport) > (unsigned long)PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
+            if ((unsigned long)(millis() - lastPressErrReport) > PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
             {
               LOG("Pressure sensor reports diagnostic fault (status %d)\n", sensorStatus);
               lastPressErrReport = millis();
@@ -1115,44 +1106,35 @@ float readPressureSensor(int pressOrtemp)
         }
         else
         {
-          lastPressErrReportNow = millis();
-          if ((unsigned long)(lastPressErrReportNow - lastPressErrReport) > (unsigned long)PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
+          if ((unsigned long)(millis() - lastPressErrReport) > PRESSURE_SENSOR_FAULT_PUB_INTERVAL_MS)
           {
             LOG("Error reading pressure sensor: got %d bytes (expected 4)\n", n);
             lastPressErrReport = millis();
           }
-          psiTminus0 = PRESSURE_SENSOR_INVALID;
-          temperature = PRESSURE_SENSOR_INVALID;
-          while ((millis() - lastPressErrReportNow) < PRESSURE_READ_INTERVAL_MS)
-            yield();
           break;
         }
       }
 
-      // Left the loop without the sensor ever reporting good data - retries exhausted on
-      // persistent stale, or a fault. Return the sentinel so the callers' existing
-      // skip-publish handling applies; otherwise a bad reading reaches Home Assistant
-      // looking indistinguishable from a real one. These are globals, so without this a
-      // previous call's value would also leak through.
+      // Left the loop without the sensor ever reporting good data - an I2C failure, retries
+      // exhausted on persistent stale, or a fault. Return the sentinel so the callers'
+      // skip-publish handling applies; otherwise a bad reading reaches Home Assistant looking
+      // indistinguishable from a real one. sensorPSI/sensorTempC persist across calls, so
+      // without this a previous call's value would leak through looking perfectly plausible.
       if (sensorStatus != M3200_STATUS_NORMAL)
       {
-        psiTminus0 = PRESSURE_SENSOR_INVALID;
-        temperature = PRESSURE_SENSOR_INVALID;
+        sensorPSI = PRESSURE_SENSOR_INVALID;
+        sensorTempC = PRESSURE_SENSOR_INVALID;
       }
     }
   }
   else
-    return(0);
+    return(PRESSURE_SENSOR_INVALID);   // no sensor fitted - not a reading of zero
 
   if (pressOrtemp == READ_TEMPERATURE)
   {
-    if (temperature == PRESSURE_SENSOR_INVALID)
-      return PRESSURE_SENSOR_INVALID;
-    if (PREFER_FAHRENHEIT)
-      return((temperature * 9 / 5) + 32);
-    else
-      return(temperature);
+    if (sensorTempC == PRESSURE_SENSOR_INVALID)
+      return(PRESSURE_SENSOR_INVALID);
+    return(PREFER_FAHRENHEIT ? (sensorTempC * 9 / 5) + 32 : sensorTempC);
   }
-  else
-    return(psiTminus0);
+  return(sensorPSI);
 }
