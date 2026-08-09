@@ -27,6 +27,45 @@ Between sessions the device publishes an idle heartbeat every 30 minutes (`HEART
 carrying pressure, temperature, and WiFi status, so a silent device is distinguishable from a
 device with nothing to say.
 
+## Counting gallons: falling edges, not levels
+
+The reed switch closes once per gallon, and a pulse is counted on the **falling edge** — the
+HIGH→LOW transition. One edge is one gallon, however long the closure lasts.
+
+There is no software debounce. An **LS18-P debounce IC** conditions the reed switch on the
+carrier PCB, so the input arrives clean. If phantom gallons ever appear, that is a hardware
+signal-integrity problem to fix at the source rather than to paper over in firmware.
+
+**Timing margin:** the HC-100 is rated to 34 GPM at 1 pulse per gallon, so pulses arrive no
+faster than 60/34 = **1765 ms** apart. `loop()` completes in a few milliseconds while a valve is
+energised — roughly 500× margin on sampling the input often enough to catch every edge.
+
+Edge triggering is not a stylistic preference. When flow stops the impeller coasts to a halt,
+and the magnet can come to rest **parked on the reed switch**, holding the input LOW
+indefinitely. Where it stops is chance, so it does not happen every time — but across enough
+runs it is bound to happen, and a healthy sensor sitting in that state is normal, not faulty.
+
+A level-triggered reading cannot express that. The original implementation blocked in a
+wait-for-release loop after each pulse, which meant a parked magnet:
+
+- stalled `loop()` for the full `INACTIVITY_TIMEOUT_SECS`,
+- then published a session report — from a code path that returned *before* gallons were
+  recorded, so the report was **all zeros**,
+- and repeated roughly every 180 seconds, indefinitely.
+
+Because every report topic is retained, each cycle overwrote the last genuine irrigation data in
+Home Assistant with zeros. **The bug was not the parked magnet; it was treating a resting sensor
+as an event.**
+
+With edge detection a parked magnet is a non-event: no new falling edge means no new pulse, the
+session ends normally through the inactivity timeout, and the report carries the real gallons
+measured before the magnet stopped. Nothing needs to detect or report the condition at all.
+
+> **Consequence:** the input is now sampled once per `loop()` pass, so loop period bounds the
+> shortest closure that can be detected. That is why the idle valve-change diagnostic is rate
+> limited — `getActiveValve()` costs a full `VALVE_AC_SAMPLE_MS` precisely when no valve is
+> energised, which is the zone-0 case that matters most.
+
 ## Valve attribution
 
 With one meter upstream of the whole manifold, the meter cannot say where the water went. Each
@@ -186,12 +225,53 @@ characteristic signature.
   `-99` from a real value in a history graph or a threshold comparison, so publishing it would
   corrupt long-term data. The retained previous value stands instead.
 
+## Losing WiFi or the broker
+
+Connection loss is handled differently at boot and at runtime, and the asymmetry is deliberate.
+
+**At boot**, `setup_wifi()` reboots the device if WiFi has not connected within 90 seconds, and
+`connectMQTT()` retries the broker up to `MAX_MQTT_CONNECT_ATTTEMPTS` times before continuing
+anyway. Blocking is fine here — nothing is being measured yet.
+
+**At runtime, the device never reboots.** It retries indefinitely. That is the right choice for
+a site with weak coverage: session accumulators live in RAM, so rebooting mid-session would
+discard every gallon counted so far, and `setup_wifi()`'s own 90-second reboot could turn a
+sustained outage into a reboot loop that measures nothing at all. **A comms failure must never
+become a data-loss failure.**
+
+The runtime reconnect path is deliberately stingy, because `loop()` also polls the flow sensor.
+Three guards, all in that block:
+
+1. **Rate limit**, and it **backs off hard while measuring**: `LINK_RETRY_IDLE_MS` (5 s) when
+   idle, `LINK_RETRY_SESSION_MS` (60 s) during a session. Even a capped 3-second attempt exceeds
+   the 1765 ms minimum pulse interval at the meter's rated 34 GPM, so every attempt made during
+   a run can cost a gallon. Retrying once a minute holds that under ~5% of the time instead of
+   most of it.
+
+   The tradeoff is explicit: **a report is not urgent, it only has to arrive eventually, whereas
+   a missed gallon is gone for good.** Only MQTT needs the backoff — `WiFi.reconnect()` does not
+   block, so it stays prompt at the idle interval either way.
+2. **`else if`** — the broker is never chased over a dead network. With no WiFi there is
+   nothing to connect to, and attempting it is pure blocking.
+3. **One attempt per pass**, via `mqttAttemptConnect()` rather than `connectMQTT()`.
+
+> **Why this matters more than it looks.** `connectMQTT()` used to be called directly from
+> `loop()`. Ten attempts × PubSubClient's default 15-second socket timeout is over two minutes
+> of blocking — *longer than `INACTIVITY_TIMEOUT_SECS`*. A single outage during a run could
+> therefore both miss flow pulses and time out the live session, fragmenting one irrigation run
+> into several reports with the gallons split between them. `MQTT_SOCKET_TIMEOUT_SECS` now caps
+> a single attempt at 3 seconds, comfortably below any plausible reed-switch interval.
+
+Both paths connect through `mqttAttemptConnect()`, which publishes `Connected` to the LWT topic
+on success. That has to be shared: the broker publishes the Last Will `Disconnected` on an
+ungraceful drop, so whichever path reconnects must clear it or Home Assistant goes on believing
+the device is offline.
+
 ## Status LEDs
 
 Driven by `updateLEDs()`, which is non-blocking and called from `loop()` **and from every
-blocking wait** — the WiFi connect loop, the MQTT connect loop, and the reed-switch closure
-wait. Miss one and the LEDs freeze there, which on a stuck reed switch means 90 seconds of
-apparently-dead device.
+remaining blocking wait** — the WiFi connect loop at boot and the MQTT connect loop. Miss one
+and the LEDs freeze there.
 
 | LED | State | Meaning |
 |---|---|---|

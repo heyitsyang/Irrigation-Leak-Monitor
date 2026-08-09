@@ -143,9 +143,54 @@ The range must exceed any reading physically achievable on your system.
 
 ## A session splits into several reports
 
-**Cause:** `INACTIVITY_TIMEOUT_SECS` is shorter than the longest gap between pulses at your
-lowest flow rate. At 1 pulse per gallon, a 4 GPM drip zone produces one pulse every 15 seconds —
-but a 1 GPM zone produces one per minute, which is uncomfortably close to the 90-second default.
+**Most likely cause:** `INACTIVITY_TIMEOUT_SECS` is shorter than the longest gap between pulses
+at your lowest flow rate. At 1 pulse per gallon, a 4 GPM drip zone produces one pulse every 15
+seconds — but a 1 GPM zone produces one per minute, which is uncomfortably close to the
+90-second default.
 
 **Fix:** raise the timeout, keeping in mind it also sets how long after a run ends before the
 report arrives.
+
+**Second cause, if it correlates with WiFi trouble:** blocking in the reconnect path. If
+`loop()` stalls for longer than `INACTIVITY_TIMEOUT_SECS` while chasing the broker, the session
+times out mid-irrigation and the next pulse opens a new one — splitting the run and dividing the
+gallons between reports.
+
+This was a real defect: `connectMQTT()` was called directly from `loop()`, and ten attempts at
+PubSubClient's default 15-second socket timeout exceeds two minutes. Fixed by capping a single
+attempt at `MQTT_SOCKET_TIMEOUT_SECS`, rate-limiting retries, and never attempting the broker
+while WiFi is down. If you see fragmented reports whose timestamps line up with
+`MQTT lost, reconnecting...` in the log, check those three are still in place.
+
+## Repeated session reports with nothing running
+
+**Symptom:** reports every ~3 minutes with no irrigation happening, each showing zeros, with a
+single blue LED blip at the start of each cycle. Home Assistant's per-zone figures keep
+resetting to 0.
+
+**Cause:** the magnet parked on the reed switch, holding the flow input LOW, combined with
+level-triggered detection. Fixed by counting falling edges instead — see
+[theory of operation](theory-of-operation.md#counting-gallons-falling-edges-not-levels).
+
+**A parked magnet is normal.** It is where the impeller happened to stop, not a fault, and needs
+no alert. If you see this symptom on firmware that predates the edge-detection change, that is
+the cause.
+
+**To check the input state at any time**, send any character to the WebSerial page. The status
+line reports `flow pin LOW (closed)` or `HIGH (open)`. LOW with no water moving means the magnet
+is parked — harmless. If it is LOW and *never* changes across several irrigation runs, then
+suspect the wiring or a failed-closed reed.
+
+## Sessions are fine but reports never arrive
+
+The device measures with or without a network — accumulators are in RAM and flow detection does
+not depend on connectivity. If sessions look right in the WebSerial log but Home Assistant sees
+nothing, the publishes are being lost.
+
+Everything is published at QoS 0, so a publish made while the broker is unreachable is simply
+dropped; there is no store-and-forward. Check `irrig_leak/status/LWT` — if it reads
+`Disconnected`, the broker saw an ungraceful drop and the device has not yet reconnected.
+
+At a site with weak coverage this is the expected failure mode, and it is preferable to the
+alternative: the device keeps counting correctly and the *next* successful report is accurate,
+rather than rebooting and losing the session outright.
