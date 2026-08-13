@@ -21,7 +21,14 @@ Nothing is subscribed. The device is publish-only.
 
 ## Idle heartbeat
 
-Published at boot and every `HEARTBEAT_SECS` (30 minutes) while no session is running.
+Published at boot and every `HEARTBEAT_SECS` (30 minutes) — **only while no session is
+running**. These topics are a between-runs baseline, so a heartbeat that comes due during
+irrigation is held until the session ends rather than publishing a zone's operating pressure
+under an "idle" name. The held heartbeat fires immediately afterwards, which gives a genuine
+post-irrigation reading.
+
+A consequence worth knowing: during a long run there is no periodic liveness signal on these
+topics. `irrig_leak/status/LWT` still reflects connection state.
 
 | Topic | Payload | Notes |
 |---|---|---|

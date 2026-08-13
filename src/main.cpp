@@ -317,8 +317,18 @@ void loop()
   }
   mqttClient.loop();
 
-  // Periodic heartbeat
-  if ((unsigned long)(millis() - lastHeartbeatMs) >= (HEARTBEAT_SECS * 1000UL))
+  // Periodic heartbeat - IDLE ONLY.
+  //
+  // Suppressed while a session is running because these topics are named "idle" and Home
+  // Assistant treats them as a between-runs baseline. A heartbeat landing mid-irrigation
+  // published that zone's operating pressure to irrig_leak/idle/water_pressure, which is a
+  // real reading of the wrong thing - observed 2026-08-13, 49.06 PSI captured during zone 4
+  // against a ~61 PSI idle line.
+  //
+  // lastHeartbeatMs is deliberately NOT advanced while suppressed, so a heartbeat that came
+  // due mid-session fires as soon as the session ends. That is wanted: it yields a genuine
+  // post-irrigation idle baseline rather than skipping the interval outright.
+  if (!sessionActive && (unsigned long)(millis() - lastHeartbeatMs) >= (HEARTBEAT_SECS * 1000UL))
   {
     lastHeartbeatMs = millis();
     LOG("\n--- Heartbeat ---\n");
