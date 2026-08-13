@@ -24,10 +24,10 @@ Defined at the top of [src/main.cpp](../src/main.cpp).
 
 | Signal | GPIO | XIAO pad | Direction | Active |
 |---|---|---|---|---|
-| `VALVE_1_PIN` | 4 | D3 | input | HIGH |
-| `VALVE_2_PIN` | 3 | D2 | input | HIGH |
-| `VALVE_3_PIN` | 2 | D1 | input | HIGH |
-| `VALVE_4_PIN` | 1 | D0 | input | HIGH |
+| `VALVE_1_PIN` | 1 | D0 | input | HIGH |
+| `VALVE_2_PIN` | 2 | D1 | input | HIGH |
+| `VALVE_3_PIN` | 3 | D2 | input | HIGH |
+| `VALVE_4_PIN` | 4 | D3 | input | HIGH |
 | `FLOW_SENSOR_BLUE_PIN` | 43 | D6 | input | LOW |
 | `FLOW_SENSOR_RED_PIN` | 44 | D7 | input | — (wired, not read) |
 | `I2C_SDA_PIN` | 5 | D4 | bidirectional | — |
@@ -110,6 +110,14 @@ Three consequences run through the entire design:
 
 ## Known hardware traps
 
+- **Valve zone numbering must match the board.** The valve GPIOs are the mapping from a
+  physical zone to the zone number reported over MQTT — nothing else records it. If they are
+  assigned in the wrong order the firmware silently reports every zone under another zone's
+  name, and the totals still reconcile perfectly, so the error is invisible in the numbers. The
+  cheap check is a manual run of each zone in turn against the `[pins: 1=? 2=? 3=? 4=?]` trace
+  in the log, which shows raw input levels and does not depend on the mapping being right.
+- **GPIO 3 is an ESP32-S3 strapping pin** and carries `VALVE_3_PIN`. It reads correctly in
+  service; worth knowing if that channel ever misbehaves at boot.
 - **Dead GPIOs on the previous board.** This project ran on a LilyGo T7-S3 until August 2026.
   That specific board developed dead pins on GPIO 15 and GPIO 18 (zones 1 and 4) — wiring and
   optocouplers were both ruled out. If zones drop out on a board swap, suspect the board before

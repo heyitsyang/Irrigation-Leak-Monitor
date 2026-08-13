@@ -31,10 +31,10 @@
 #define BUILT_IN_LED_PIN 21                         // yellow - link status, ACTIVE LOW
 #define STATUS_LED_PIN 7                            // blue - flow/report activity, ACTIVE HIGH
 
-#define VALVE_1_PIN 4
-#define VALVE_2_PIN 3
-#define VALVE_3_PIN 2
-#define VALVE_4_PIN 1
+#define VALVE_1_PIN 1
+#define VALVE_2_PIN 2
+#define VALVE_3_PIN 3
+#define VALVE_4_PIN 4
 
 #define FLOW_SENSOR_BLUE_PIN 43                       // Hunter HC100FLOW flow meter - ACTIVE LOW, 1 pulse/gallon
 #define FLOW_SENSOR_RED_PIN 44                        // second meter lead - wired and pulled up, not read by the firmware
